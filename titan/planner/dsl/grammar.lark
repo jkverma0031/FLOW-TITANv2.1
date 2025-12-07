@@ -1,62 +1,60 @@
+// Path: titan/planner/dsl/grammar.lark
 %declare INDENT DEDENT
-%import common.NEWLINE
-%import common.CNAME -> NAME
-%import common.SIGNED_NUMBER -> NUMBER
-%import common.ESCAPED_STRING
-%import common.WS_INLINE
 
-// FIX: Define DOT as a standard terminal to resolve the GrammarError.
+// --- TOKENS ---
+// Defined explicitly so they appear in the parse tree
 DOT: "."
+COMMA: ","
+LPAR: "("
+RPAR: ")"
+EQ: "="
+EQEQ: "=="
+NEQ: "!="
+GT: ">"
+LT: "<"
+GTE: ">="
+LTE: "<="
+IN: "in"
+OR: "or"
+AND: "and"
+COLON: ":"
 
-%ignore WS_INLINE
+NAME: /[a-zA-Z_]\w*/
+NUMBER: /\d+(\.\d+)?/
+ESCAPED_STRING: /"[^"\n]*"/
+_NEWLINE: /(\r?\n[\t ]*)+/
+WS: /[ \t\f]+/
+
+%ignore WS
 %ignore /#[^\n]*/
 
-start: NEWLINE* stmt_list
+// --- RULES ---
 
-stmt_list: (stmt)+
+start: (_NEWLINE | stmt)*
 
-# -------------------------------------
-# Statement = assignment OR expression
-# -------------------------------------
-?stmt: assignment NEWLINE
-     | expr NEWLINE
-     | compound_stmt
+?stmt: simple_stmt | compound_stmt
 
-assignment: NAME "=" expr
+simple_stmt: (assignment | expr_stmt) _NEWLINE
 
-compound_stmt: if_stmt
-             | for_stmt
-             | retry_stmt
+compound_stmt: if_stmt | for_stmt | retry_stmt
 
-# -------------------------------------
-# Calls
-# -------------------------------------
-call_expr: NAME "(" [arg_list] ")"
+assignment: NAME EQ expr
+expr_stmt: expr
 
-arg_list: arg ("," arg)* [","]
+// Note: suite logic relies on explicit INDENT/DEDENT handling
+if_stmt: "if" expr COLON suite ["else" COLON suite]
+for_stmt: "for" NAME IN expr COLON suite
+retry_stmt: "retry" "attempts" EQ NUMBER ["backoff" EQ NUMBER] COLON suite
 
-arg: NAME "=" expr      -> keyword_arg
-   | expr               -> positional_arg
+suite: simple_stmt | _NEWLINE INDENT stmt+ DEDENT
 
-# -------------------------------------
-# IF / FOR / RETRY
-# -------------------------------------
-if_stmt: "if" expr ":" NEWLINE INDENT stmt_list DEDENT("else" ":" NEWLINE INDENT stmt_list DEDENT)?
-for_stmt: "for" NAME "in" expr ":" NEWLINE INDENT stmt_list DEDENT
+// Expressions
+expr: or_test
 
-retry_stmt: "retry" "attempts" "=" NUMBER["backoff" "=" NUMBER]":" NEWLINE INDENT stmt_list DEDENT
+or_test: and_test (OR and_test)*
+and_test: comparison (AND comparison)*
+comparison: attr_access ((EQEQ | NEQ | GT | LT | GTE | LTE | IN) attr_access)*
 
-# -------------------------------------
-# Expression Grammar
-# -------------------------------------
-?expr: or_test
-
-or_test: and_test ("or" and_test)*
-and_test: comparison ("and" comparison)*
-
-comparison: attr_access (("==" | "!=" | "<" | ">" | "<=" | ">=" | "in") attr_access)*
-
-# Allow dot notation for result/variable access (e.g., t1.result.ok)
 attr_access: atom (DOT NAME)*
 
 atom: call_expr
@@ -64,6 +62,11 @@ atom: call_expr
     | NUMBER
     | ESCAPED_STRING
     | "(" expr ")"
+
+call_expr: NAME LPAR [arg_list] RPAR
+arg_list: arg (COMMA arg)* [COMMA]
+arg: NAME EQ expr      -> keyword_arg
+   | expr               -> positional_arg
 
 value: ESCAPED_STRING -> string
      | NUMBER         -> number
