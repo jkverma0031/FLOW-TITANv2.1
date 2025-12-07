@@ -1,34 +1,59 @@
-# Path: FLOW/titan/memory/vector_store.py
+# titan/memory/vector_store.py
 from __future__ import annotations
-from typing import Protocol, List, Dict, Any, Optional
-from titan.schemas.memory import MemoryRecord
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Optional, Tuple
 
-
-class VectorStore(Protocol):
+class VectorStore(ABC):
     """
-    Protocol for vector stores used by TITAN memory subsystem.
-    Implementations must be thread-safe.
+    Abstract Base Class for all Vector Store implementations (Annoy, FAISS, etc.).
+    Enforces a stable API contract for the Planner and Executor subsystems.
+    This pattern ensures the memory system can be replaced easily without
+    modifying the Core Kernel logic.
     """
 
-    def add(self, record: MemoryRecord) -> None:
-        """Add a single MemoryRecord (embedding may be present or None)."""
+    @abstractmethod
+    def init(self, vector_dim: int, **kwargs):
+        """Initializes the store, ensuring all necessary indices/tables exist."""
+        pass
 
-    def add_many(self, records: List[MemoryRecord]) -> None:
-        """Add many records efficiently."""
+    @abstractmethod
+    def add(self, text: str, embedding: List[float], metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Adds a single record to the store and returns a unique ID."""
+        pass
 
-    def query_by_text(self, text: str, embed_fn: callable, top_k: int = 10) -> List[Dict[str, Any]]:
+    @abstractmethod
+    def add_many(self, records: List[Tuple[str, List[float], Optional[Dict[str, Any]]]]) -> List[str]:
+        """Adds multiple records efficiently."""
+        pass
+
+    @abstractmethod
+    def query(self, query_vector: List[float], k: int = 5, filter_metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
-        Query by text: embed the text using embed_fn(text) and return top_k results.
-        Results are dicts with at least: id, text, metadata, score, created_at.
-        """
+        Performs a nearest neighbor search.
 
-    def query_by_embedding(self, embedding: List[float], top_k: int = 10) -> List[Dict[str, Any]]:
+        Returns a list of dictionaries, where each dict contains:
+        {'id': str, 'text': str, 'metadata': dict, 'score': float}
         """
-        Query by embedding vector. Returns top_k results sorted by decreasing score.
-        """
+        pass
 
-    def persist(self) -> None:
-        """Persist short-term buffers to long-term storage (e.g., rebuild indexes)."""
+    @abstractmethod
+    def query_by_text(self, text: str, k: int = 5, filter_metadata: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Queries the store by text, handles embedding internally."""
+        pass
 
-    def close(self) -> None:
-        """Close DB connections / release resources."""
+    @abstractmethod
+    def persist(self):
+        """Forces the vector index and metadata to be written to disk."""
+        pass
+
+    @abstractmethod
+    def rebuild_index(self):
+        """Rebuilds the underlying vector index for optimal performance."""
+        pass
+
+    @abstractmethod
+    def close(self):
+        """Closes all connections and flushes data."""
+        pass
+
+# The PersistentAnnoyStore must now inherit from VectorStore and implement all @abstractmethods.

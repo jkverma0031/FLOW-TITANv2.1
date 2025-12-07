@@ -2,7 +2,6 @@
 %declare INDENT DEDENT
 
 // --- TOKENS ---
-// Defined explicitly so they appear in the parse tree
 DOT: "."
 COMMA: ","
 LPAR: "("
@@ -38,7 +37,7 @@ simple_stmt: (assignment | expr_stmt) _NEWLINE
 
 compound_stmt: if_stmt | for_stmt | retry_stmt
 
-assignment: NAME EQ expr
+assignment: NAME EQ call_expr
 expr_stmt: expr
 
 // Note: suite logic relies on explicit INDENT/DEDENT handling
@@ -48,19 +47,18 @@ retry_stmt: "retry" "attempts" EQ NUMBER ["backoff" EQ NUMBER] COLON suite
 
 suite: simple_stmt | _NEWLINE INDENT stmt+ DEDENT
 
-// Expressions
+// Expressions - Order of precedence is defined by rule ordering in lark, but we rely on explicit grouping here
 expr: or_test
 
 or_test: and_test (OR and_test)*
 and_test: comparison (AND comparison)*
 comparison: attr_access ((EQEQ | NEQ | GT | LT | GTE | LTE | IN) attr_access)*
 
+// Core fix: Atom can be a value (variable, string, number)
 attr_access: atom (DOT NAME)*
 
 atom: call_expr
-    | NAME
-    | NUMBER
-    | ESCAPED_STRING
+    | value
     | "(" expr ")"
 
 call_expr: NAME LPAR [arg_list] RPAR
@@ -68,6 +66,7 @@ arg_list: arg (COMMA arg)* [COMMA]
 arg: NAME EQ expr      -> keyword_arg
    | expr               -> positional_arg
 
-value: ESCAPED_STRING -> string
-     | NUMBER         -> number
-     | NAME           -> name
+// NEW RULE: Represents literal values/variables for expressions
+value: ESCAPED_STRING -> string_value
+     | NUMBER         -> number_value
+     | NAME           -> name_value

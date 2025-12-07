@@ -7,6 +7,7 @@ from uuid import uuid4
 
 
 class ActionType(str, Enum):
+    # Enum values must be lowercase to correctly enforce ActionType in the Negotiator
     EXEC = "exec"
     PLUGIN = "plugin"
     HOST = "host"
@@ -19,6 +20,8 @@ def new_action_id(prefix: str = "a") -> str:
 
 class Action(BaseModel):
     id: str = Field(default_factory=new_action_id)
+    # The type field will automatically normalize to lowercase string on creation
+    # e.g., Action(type="EXEC") -> type="exec"
     type: ActionType
     command: Optional[str] = None
     module: Optional[str] = None
@@ -35,10 +38,12 @@ class Action(BaseModel):
         if self.type == ActionType.EXEC:
             if not self.command:
                 raise ValueError("EXEC actions require a command")
+            self.module = None
 
         if self.type in (ActionType.PLUGIN, ActionType.HOST):
             if not self.module:
                 raise ValueError(f"{self.type.value.upper()} actions require a module name")
+            self.command = None # Module actions don't use a raw command field
 
         return self
 

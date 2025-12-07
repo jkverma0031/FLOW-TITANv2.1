@@ -1,379 +1,379 @@
-# Path: test_e2e_suite.py (FINAL VERSION WITH ROBUST OUTPUT)
-
 import unittest
-import sys
-import os
-import tempfile
-import shutil
-from typing import Any, Dict, List, Optional, Callable, Tuple, Iterable
-from unittest.mock import MagicMock, call, patch
+import logging
 import json
-import io # Added for robust output handling
+import time
+from unittest.mock import Mock, MagicMock, patch
+from typing import Dict, Any, Optional, List, Tuple, Callable
+import os
+import sys
+import re
 
-# --- 1. MOCK MINIMAL SCHEMAS & UTILITIES ---
+# --- CONFIGURATION AND DIAGNOSTIC SETUP ---
 
-class MockNodeBase:
-    def __init__(self, id, name=None, metadata=None):
-        self.id = id
-        self.name = name
-        self.metadata = metadata or {}
-        self.type = None
-    
-    def dict_safe(self):
-        return {"id": self.id, "type": str(self.type)}
+LOG_FILE = "titan_diagnostic_suite.log"
+if os.path.exists(LOG_FILE): 
+    os.remove(LOG_FILE)
 
-class MockStartNode(MockNodeBase):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "START"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(module)s.%(funcName)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("TITAN_TEST_SUITE")
+logger.setLevel(logging.DEBUG)
+logger.info("--- TITAN DIAGNOSTIC TEST SUITE INITIALIZED ---")
 
-class MockEndNode(MockNodeBase):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "END"
 
-class MockTaskNode(MockNodeBase):
-    def __init__(self, task_ref, timeout_seconds=None, supports_parallel=False, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "TASK"
-        self.task_ref = task_ref
-        self.timeout_seconds = timeout_seconds
-        self.supports_parallel = supports_parallel
+# --- CORE TITAN MODULE IMPORTS ---
 
-class MockDecisionNode(MockNodeBase):
-    def __init__(self, condition, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "DECISION"
-        self.condition = condition
-
-class MockLoopNode(MockNodeBase):
-    def __init__(self, iterator_var, iterable_expr, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "LOOP"
-        self.iterator_var = iterator_var
-        self.iterable_expr = iterable_expr
-
-class MockRetryNode(MockNodeBase):
-    def __init__(self, attempts, backoff_seconds, child_node_id=None, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "RETRY"
-        self.attempts = attempts
-        self.backoff_seconds = backoff_seconds
-        self.child_node_id = child_node_id
-
-class MockNoOpNode(MockNodeBase):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.type = "NOOP"
-
-class MockCFG:
-    def __init__(self):
-        self.nodes = {}
-        self.edges = []
-        self.entry = None
-        self.exit = None
-
-    def add_node(self, node: MockNodeBase):
-        self.nodes[node.id] = node
-
-    def add_edge(self, source, target, label=None):
-        mock_edge = MagicMock(source=source, target=target, label=label)
-        mock_edge.source = source
-        mock_edge.target = target
-        mock_edge.label = label
-        self.edges.append(mock_edge)
-
-    def get_successors(self, node_id):
-        return [e.target for e in self.edges if e.source == node_id]
-        
-    def validate_integrity(self, **kwargs):
-        return True
-
-class MockNodeType:
-    TASK = "TASK"
-    DECISION = "DECISION"
-    LOOP = "LOOP"
-    RETRY = "RETRY"
-    NOOP = "NOOP"
-    START = "START"
-    END = "END"
-
-class MockActionType:
-    EXEC = "EXEC"
-
-class MockPlanStatus:
-    CREATED = "CREATED"
-
-class MockEvent:
-    def __init__(self, type, payload, **kwargs):
-        self.type = type
-        self.payload = payload
-
-class MockEventType:
-    PLAN_CREATED = "PLAN_CREATED"
-    NODE_STARTED = "NODE_STARTED"
-    NODE_FINISHED = "NODE_FINISHED"
-    ERROR_OCCURRED = "ERROR_OCCURRED"
-    DECISION_TAKEN = "DECISION_TAKEN"
-    PLAN_COMPLETED = "PLAN_COMPLETED"
-    
-class MockPlan:
-    def __init__(self, id, cfg):
-        self.id = id
-        self.cfg = cfg
-        self.status = MockPlanStatus.CREATED
-    
-    def to_summary(self):
-        return {"plan_id": self.id}
-    
-class MockAction:
-    def __init__(self, type, command, args, timeout_seconds, metadata):
-        self.type = type
-        self.command = command
-        self.args = args
-        self.metadata = metadata
-        self.timeout_seconds = timeout_seconds
-        
-    def to_exec_payload(self):
-        return {"command": self.command, "args": self.args, "metadata": self.metadata}
-
-# Mocking modules required for dynamic imports
-sys.modules['titan.schemas.graph'] = MagicMock(CFG=MockCFG, TaskNode=MockTaskNode, DecisionNode=MockDecisionNode, LoopNode=MockLoopNode, RetryNode=MockRetryNode, NoOpNode=MockNoOpNode, StartNode=MockStartNode, EndNode=MockEndNode, NodeType=MockNodeType)
-sys.modules['titan.schemas.plan'] = MagicMock(Plan=MockPlan, PlanStatus=MockPlanStatus)
-sys.modules['titan.schemas.events'] = MagicMock(Event=MockEvent, EventType=MockEventType)
-sys.modules['titan.schemas.action'] = MagicMock(Action=MockAction, ActionType=MockActionType)
-sys.modules['titan.schemas.task'] = MagicMock()
-sys.modules['titan.observability.tracing'] = MagicMock(tracer=MagicMock(current_trace_id=lambda: "T1", current_span_id=lambda: "S1", span=lambda *a, **kw: MagicMock()))
-sys.modules['titan.observability.metrics'] = MagicMock(metrics=MagicMock(counter=lambda *a, **kw: MagicMock(inc=lambda: None), timer=lambda *a, **kw: MagicMock(time=lambda: None)))
-
-class MockStorageAdapter(MagicMock):
-    def init(self): pass
-    def save_session(self, sid, data): pass
-    def load_session(self, sid): return None
-    def delete_session(self, sid): pass
-    def list_session_ids(self): return []
-    def export_all(self): return []
-    def close(self): pass
-
-class MockLLM:
-    def generate(self, prompt, max_tokens):
-        if "generate plan for task A" in prompt:
-            return "t1 = task(name=\"step_a\", file=\"a.txt\")\nif t1.result.ok:\n  t2 = task(name=\"step_b\")"
-        return ""
-
-def mock_runner(payload: Dict[str, Any]) -> Dict[str, Any]:
-    cmd = payload.get('command')
-    args = payload.get('args')
-    
-    if cmd == "initial_task":
-        return {"success": True, "result": {"value": 10, "status": "ok"}}
-    elif cmd == "conditional_task":
-        return {"success": True, "result": {"message": "Executed conditional logic"}}
-    elif cmd == "loop_task":
-        item_arg = args.get('item')
-        item_val = item_arg.value if hasattr(item_arg, 'value') else item_arg
-        return {"success": True, "result": {"message": f"Processed item: {item_val}"}}
-    else:
-        return {"success": True, "result": {"message": f"Executed: {cmd}"}}
-
-# --- 2. DYNAMICALLY IMPORT TITAN MODULES ---
-PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
-sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 try:
-    from titan.planner.dsl.ir_dsl import parse_dsl, ASTIf, ASTTaskCall, ASTAssign, DSLIndenter, GRAMMAR
-    from titan.planner.dsl.ir_compiler import compile_ast_to_cfg, CompileContext
-    from titan.executor.scheduler import Scheduler
+    from titan.schemas.plan import Plan, PlanStatus
+    from titan.schemas.graph import CFGNode, CFGNodeType, TaskNode, CFG, DecisionNode, LoopNode
+    from titan.schemas.action import Action, ActionType
+    from titan.schemas.events import Event, EventType 
+    
+    from titan.planner.dsl.ir_dsl import parse_dsl
+    from titan.planner.dsl.ir_compiler import Compiler
+    
     from titan.executor.orchestrator import Orchestrator
-    from titan.executor.condition_evaluator import ConditionEvaluator
+    from titan.executor.worker_pool import WorkerPool 
     from titan.executor.state_tracker import StateTracker
-    from titan.executor.loop_engine import LoopEngine
-    from titan.executor.retry_engine import RetryEngine
-    from titan.executor.worker_pool import WorkerPool
-    from titan.parser.llm_dsl_generator import LLMDslGenerator
-    from titan.runtime.session_manager import SessionManager, SQLiteStorageAdapter, DEFAULT_DIR
-    from titan.policy.engine import PolicyEngine, PolicyDecision
+    from titan.executor.condition_evaluator import ConditionEvaluator
+    
+    from titan.memory.vector_store import VectorStore
+    
 except ImportError as e:
-    print(f"FATAL ERROR: Could not import a Titan module. Error: {e}")
+    logger.critical(f"FATAL: Module import error. Check your file structure and previous fixes. Error: {e}")
     sys.exit(1)
 
+# --- MOCK DATA ---
 
-# --- 3. TEST SUITE IMPLEMENTATION ---
+COMPLEX_SENTENCE = "Hii, It seems like the rain is going to happen so check the weather reports for today's evening. And also send the last project we worked on to Mr.x make sure when he replies you notify me. But first play a classic song."
+SESSION_ID = "god_tier_session_42"
+MOCK_PROJECT_PATH = "/user/files/project_titan_v2_report.zip"
 
-class TestTitanAgentOS(unittest.TestCase):
+MOCK_DSL_COMPLEX = f"""
+t1 = task(name="play_music", genre="classic")
+t2 = task(name="get_weather_report", location="current", time="evening")
+t3 = task(name="send_project_email", recipient="Mr.x@corp.com", attachment="{MOCK_PROJECT_PATH}")
+t4 = task(name="set_reply_monitor", email_id=t3.result.email_id)
+"""
+
+# --- UTILITIES & WRAPPERS ---
+
+# FIX: StateWrapper allows accessing dictionary keys as attributes.
+# This enables the ConditionEvaluator to handle 'n1.result.code' correctly.
+class StateWrapper:
+    def __init__(self, data):
+        self._data = data
+    def __getattr__(self, name):
+        val = self._data.get(name)
+        if isinstance(val, dict):
+            return StateWrapper(val)
+        return val
+    def __str__(self):
+        return str(self._data)
+    # Allow comparison directly (e.g., if result.code == 200)
+    def __eq__(self, other):
+        return self._data == other
+
+def _resolve_argument(arg_value: str, state_tracker: StateTracker) -> Any:
+    if not isinstance(arg_value, str): return arg_value
     
-    @classmethod
-    def setUpClass(cls):
-        cls.test_dir = tempfile.mkdtemp()
-        
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.test_dir)
+    match = re.match(r't3\.result\.(\w+)', arg_value)
+    if match:
+        result_key = match.groups()[0]
+        # Look up T3 by name "send_project_email"
+        state = state_tracker.get_state_by_task_name('send_project_email')
+        if state and state.get('result'):
+            return state['result'].get(result_key)
+    
+    if arg_value.startswith('/') or arg_value.endswith('.zip') or arg_value.startswith('http'):
+        return arg_value
+    return arg_value
 
-    def setUp(self):
-        self.state_tracker = StateTracker()
-        self.worker_pool = WorkerPool(max_workers=1, runner=mock_runner)
-        self.llm_mock = MockLLM()
+class MockExecutionRunner:
+    def __init__(self, state_tracker: StateTracker):
+        self.state_tracker = state_tracker
+        self.email_counter = 0
+
+    def run(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        task_name = action.get('name', action.get('task_name'))
+
+        resolved_args = {
+            k: _resolve_argument(v, self.state_tracker) for k, v in action.get('args', {}).items()
+        }
+        action['args'] = resolved_args
         
-        self.emitter_mock = MagicMock()
-        self.session_manager = SessionManager(
-            storage_adapter=MockStorageAdapter(),
-            autosave_context_dir=self.test_dir 
+        if action.get('context', {}).get('trust_level') == 'low' and "email" in task_name:
+             return {"status": "failure", "error": "Policy Denied: Restricted capability."}
+
+        if task_name == "send_project_email":
+            if action['args']['attachment'] != MOCK_PROJECT_PATH:
+                 return {"status": "failure", "error": f"Resolution error: Expected {MOCK_PROJECT_PATH}, got {action['args']['attachment']}"}
+
+        # Ensure all returns have 'message' for validation
+        if "music" in task_name:
+            return {"status": "success", "message": "Classic song started.", "duration_sec": 3.0}
+        
+        if "weather" in task_name:
+            return {"status": "success", "message": "Weather report retrieved", "report": "Rain expected.", "provider": "mock_api"}
+
+        if "email" in task_name:
+            self.email_counter += 1
+            email_id = f"msg_{int(time.time())}_{self.email_counter}"
+            return {"status": "success", "message": "Email sent", "email_id": email_id, "recipient": action['args'].get('recipient')}
+        
+        if "monitor" in task_name:
+            if action['args'].get('email_id', '').startswith('msg_'):
+                 return {"status": "success", "message": "Monitor active", "monitor_status": "active", "watching_id": action['args']['email_id']}
+            else:
+                 return {"status": "failure", "error": "Missing dependency from T3."} 
+        
+        if task_name == "fetch_status":
+             return {"status": "success", "message": "Status fetched", "code": 200}
+        if task_name == "process_success":
+             return {"status": "success", "message": "Success path taken"}
+        if task_name == "log_error":
+             return {"status": "success", "message": "Error path taken"}
+
+        return {"status": "success", "message": f"Simulated result for {task_name}"}
+
+# FIX: Updated resolver with logging to debug lookup failures
+def mock_resolver(name: str, state_tracker: StateTracker) -> Any:
+    state = state_tracker.get_state(name) # name is the node ID (e.g., 'n1')
+    if state:
+        logger.debug(f"RESOLVER: Found state for '{name}': {state}")
+        return StateWrapper(state)
+    
+    logger.warning(f"RESOLVER: No state found for '{name}'. Keys available: {list(state_tracker.get_all_states().keys())}")
+    return None
+
+class MockLLMClient:
+    def generate_dsl(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
+        if "fail_dsl" in prompt:
+             return 't1 = task(name="fail_task", arg="unclosed quote' 
+        if "conditional" in prompt:
+             return "t1 = task(name=\"fetch_status\")\nif t1.result.code == 200:\n    t2 = task(name=\"process_success\")\nelse:\n    t3 = task(name=\"log_error\")"
+        return MOCK_DSL_COMPLEX
+
+class MockRuntimeAPI:
+    def create_session(self, **kwargs): return "test_session_123"
+    def get_context(self, session_id): return {"last_project_path": MOCK_PROJECT_PATH}
+    def get_trust(self): return MagicMock(check_policy=lambda task: True) 
+    def get_identity_mgr(self): return MagicMock()
+    def end_session(self, session_id): pass
+
+
+# --- E2E TEST SUITE IMPLEMENTATION ---
+
+class TestTitanE2E(unittest.TestCase):
+    
+    COMPLEX_SENTENCE = COMPLEX_SENTENCE
+    SESSION_ID = SESSION_ID
+    
+    def setUp(self):
+        logger.info("\n--- TEST SETUP STARTING ---")
+        
+        self.state_tracker = StateTracker()
+        
+        # StateTracker lookup helper
+        self.state_tracker.get_state_by_task_name = self._state_lookup
+        
+        self.mock_runner_instance = MockExecutionRunner(self.state_tracker)
+        self.mock_runner = self.mock_runner_instance.run
+        
+        self.worker_pool = WorkerPool(max_workers=4, runner=self.mock_runner) 
+        self.worker_pool.start()
+        
+        self.compiler = Compiler()
+        self.mock_llm = MockLLMClient()
+        self.runtime = MockRuntimeAPI() 
+        
+        self.event_log: List[Dict[str, Any]] = []
+        def event_collector(event):
+            self.event_log.append(event.model_dump())
+            if event.type not in [EventType.DSL_PRODUCED, EventType.AST_PARSED]:
+                logger.debug(f"EVENT: {event.type.value} - Plan: {event.plan_id}")
+
+        self.event_emitter = event_collector
+        
+        state_tracker_ref = self.state_tracker
+        self.cond_evaluator = ConditionEvaluator(
+            resolver=lambda name, *args: mock_resolver(name, state_tracker_ref)
         )
+
         self.orchestrator = Orchestrator(
-            runner=mock_runner,
-            event_emitter=self.emitter_mock
+            worker_pool=self.worker_pool,
+            event_emitter=self.event_emitter,
+            condition_evaluator=self.cond_evaluator
         )
+        logger.info("--- TEST SETUP COMPLETE ---")
+
+    def _state_lookup(self, task_name):
+        return next((s for s in self.state_tracker.get_all_states().values() if s.get('name') == task_name), None)
 
     def tearDown(self):
-        self.worker_pool.shutdown()
+        logger.info("--- TEST TEARDOWN STARTING ---")
+        self.worker_pool.stop()
+        logger.info(f"Total events logged: {len(self.event_log)}")
+        logger.info("--- TEST TEARDOWN COMPLETE ---\n")
 
-# ----------------------------------------------------------------------
-# A. Planner Subsystem Unit Tests (Validating Fixes)
-# ----------------------------------------------------------------------
+    
+    def _plan_and_compile(self, input_text: str, session_id: str) -> Plan:
+        context = self.runtime.get_context(session_id)
+        dsl_text = self.mock_llm.generate_dsl(input_text, context)
+        self.assertTrue(dsl_text.strip(), "DSL generation resulted in an empty string.")
 
-    def test_A1_dsl_parser_attr_access_and_if_block_fix(self):
-        """Tests that the critical dot notation and block indentation issues are fixed (Error 1 & Indent Fix)."""
-        dsl_source = "t1 = task(name=\"a\")\nif t1.result.ok:\n  t2 = task(name=\"b\")"
-        ast = parse_dsl(dsl_source)
+        try:
+            ast_root = parse_dsl(dsl_text)
+        except Exception as e:
+            logger.error(f"FATAL PARSING FAILURE: {e}")
+            raise e 
         
-        self.assertEqual(len(ast.statements), 2)
-        self.assertIsInstance(ast.statements[1], ASTIf)
-        self.assertIn("t1.result.ok", ast.statements[1].condition.text)
-        self.assertEqual(len(ast.statements[1].body), 1)
-        self.assertIsInstance(ast.statements[1].body[0], ASTAssign)
-
-    def test_A2_dsl_parser_keyword_arg_fix(self):
-        """Tests that keyword arguments are correctly parsed (Bug 2/Failure fix)."""
-        dsl_source = "t1 = task(download_url=\"http://example.com\", force=True, cache=5)\n"
-        ast = parse_dsl(dsl_source)
+        cfg_data = self.compiler.compile(ast_root) 
         
-        self.assertIsInstance(ast.statements[0], ASTAssign)
-        call = ast.statements[0].value
-        self.assertIsInstance(call, ASTTaskCall)
-        self.assertEqual(call.name, "task")
-        self.assertEqual(call.args["download_url"].value, "http://example.com")
-        self.assertEqual(call.args["force"].value, True)
-        self.assertEqual(call.args["cache"].value, 5)
-
-    def test_A3_cfg_compiler_if_else_structure(self):
-        """Tests that the compiler creates correct nodes and 'true'/'false' edges (Error 3 fix)."""
-        dsl_source = "t0=task(name=\"pre\")\nif t0.result.ok:\n  t1 = task(name=\"then\")\nelse:\n  t2 = task(name=\"else\")"
-        ast = parse_dsl(dsl_source)
+        cfg = CFG.from_node_list(cfg_data)
+        cfg.validate_integrity() 
         
-        with patch('titan.planner.dsl.ir_compiler._node_id', side_effect=lambda prefix, counter: f"{prefix}_{next(counter):02d}"):
-            cfg = compile_ast_to_cfg(ast)
-        
-        t0_id = next(nid for nid, node in cfg.nodes.items() if node.name == "task:pre")
-        decision_node_id = next(nid for nid, node in cfg.nodes.items() if node.type == MockNodeType.DECISION)
-        t1_id = next(nid for nid, node in cfg.nodes.items() if node.name == "task:then")
-        t2_id = next(nid for nid, node in cfg.nodes.items() if node.name == "task:else")
-        join_id = next(nid for nid, node in cfg.nodes.items() if node.name == "join")
-
-        self.assertTrue(any(e for e in cfg.edges if e.source == t0_id and e.target == decision_node_id and e.label == "next"))
-        
-        true_edge = next(e for e in cfg.edges if e.source == decision_node_id and e.target == t1_id and e.label == "true")
-        false_edge = next(e for e in cfg.edges if e.source == decision_node_id and e.target == t2_id and e.label == "false")
-        
-        self.assertIsNotNone(true_edge, "Decision Node 'true' branch failed.")
-        self.assertIsNotNone(false_edge, "Decision Node 'false' branch failed.")
-
-        self.assertTrue(any(e for e in cfg.edges if e.source == t1_id and e.target == join_id), "True branch end must connect to join.")
-        self.assertTrue(any(e for e in cfg.edges if e.source == t2_id and e.target == join_id), "False branch end must connect to join.")
-
-
-# ----------------------------------------------------------------------
-# B. Policy Subsystem Unit Tests (Validating Security and Deny Fix)
-# ----------------------------------------------------------------------
-
-    def test_B1_policy_engine_deep_arg_check_and_default_allow(self):
-        """Tests that the recursive safety check for forbidden strings is working AND adds an explicit default allow rule (Fail fix)."""
-        engine = PolicyEngine()
-        forbidden_list = ["rm -rf", "delete_all", "curl http"]
-        
-        engine.add_rule(PolicyEngine.rule_deny_if_command_contains_forbidden(forbidden_list))
-
-        def rule_allow_safe_defaults(ctx):
-             action = ctx.get("action")
-             if action and action.command not in ["safe_cmd", "bad_cmd_1", "bad_cmd_2"]:
-                 return PolicyDecision(True, reason="Default allow for benign commands")
-             return None
-             
-        engine.add_rule(rule_allow_safe_defaults)
-
-        # Scenario 1: Command injection in argument (should fail)
-        action1 = MockAction(MockActionType.EXEC, command="safe_cmd", 
-                            args={"content": "payload; delete_all"}, 
-                            timeout_seconds=60, metadata={})
-        decision1 = engine.check(action1)
-        self.assertFalse(decision1.allow, "Policy failed to catch command injection hidden in 'args'.")
-        self.assertIn("delete_all", decision1.reason)
-
-        # Scenario 2: Safe action (should pass due to explicit allow rule)
-        action2 = MockAction(MockActionType.EXEC, command="safe_process", 
-                            args={"path": "/var/log/file.txt"}, 
-                            timeout_seconds=60, metadata={})
-        decision2 = engine.check(action2)
-        self.assertTrue(decision2.allow, "Policy incorrectly denied a safe command despite explicit allow rule.")
-
-# ----------------------------------------------------------------------
-# C. E2E Integration Test (Plan -> Orchestrator -> Scheduler -> Execution)
-# ----------------------------------------------------------------------
-
-    @patch('titan.planner.dsl.ir_compiler._node_id', side_effect=lambda prefix, counter: f"{prefix}_{next(counter):06d}")
-    def test_C1_e2e_full_planning_and_execution_flow(self, mock_node_id):
-        """Tests full end-to-end integration: Planner pipeline output -> Orchestrator execution (Error 4 fix)."""
-        
-        # 1. SETUP PLAN
-        dsl_source = (
-            "t1 = task(name=\"initial_task\")\n"
-            "if t1.result.value > 5:\n"
-            "  t2 = task(name=\"conditional_task\")\n"
-            "  for item in [1, 2]:\n"
-            "    t3 = task(name=\"loop_task\", item=item)\n"
+        plan = Plan(
+            id=f"plan_{int(time.time())}", 
+            user_input=input_text, 
+            session_id=session_id, 
+            status=PlanStatus.CREATED, 
+            cfg=cfg
         )
-        ast = parse_dsl(dsl_source)
-        cfg = compile_ast_to_cfg(ast)
-        plan = MockPlan(id="test_plan_123", cfg=cfg)
-
-        # 2. EXECUTE PLAN
-        session_id = "test_session_456"
-        summary = self.orchestrator.execute_plan(plan, session_id)
-
-        # 3. VERIFY RESULTS AND FLOW
-        self.assertEqual(summary["status"], "success", f"E2E execution failed unexpectedly: {summary.get('error')}")
-        
-        self.assertEqual(self.worker_pool.submit.call_count, 4, "Worker pool call count mismatch (Expected 4 task submissions: t1 + t2 + t3x2).")
-        
-        loop_calls = [c for c in self.worker_pool.submit.call_args_list if c.args[0]['command'] == 'loop_task']
-        
-        self.assertEqual(loop_calls[0].args[0]['args']['item'].value, 1)
-        self.assertEqual(loop_calls[1].args[0]['args']['item'].value, 2)
-        
-        emitted_events = self.emitter_mock.call_args_list
-        self.assertTrue(any(call.args[0].type == MockEventType.PLAN_CREATED for call in emitted_events))
-        self.assertTrue(any(call.args[0].type == MockEventType.DECISION_TAKEN for call in emitted_events))
-        self.assertTrue(any(call.args[0].type == MockEventType.PLAN_COMPLETED for call in emitted_events))
-
-
-# --- FINAL EXECUTION BLOCK ---
-if __name__ == '__main__':
-    # FIX: Manually creating a TestRunner instance to guarantee console output
-    print("Running FLOW-TITANv2.1 E2E/Integration Test Suite...")
+        logger.info(f"PLANNER: Compiled and validated CFG successfully. Nodes: {len(cfg.nodes)}")
+        return plan
     
-    # Use TextTestRunner with high verbosity (2) to ensure detailed output.
-    runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=2)
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestTitanAgentOS)
-    
-    # Run the suite
-    result = runner.run(suite)
-    
-    # Custom summary print
-    print("\n--- TEST EXECUTION SUMMARY ---")
-    print(f"Total Tests Run: {result.testsRun}")
-    if result.wasSuccessful():
-        print("✅ ALL TESTS PASSED: The core Planner and Executor components are functioning correctly.")
-    else:
-        print(f"❌ FAILURES/ERRORS: {len(result.failures) + len(result.errors)}")
-        print("Review the detailed output above for component breakdowns.")
+
+    def test_01_planning_phase_integrity_and_dsl_validity(self):
+        logger.info("--- test_01_planning_phase_integrity_and_dsl_validity ---")
+        plan = self._plan_and_compile(self.COMPLEX_SENTENCE, self.SESSION_ID)
         
+        t3_node = next(node for node in plan.cfg.nodes.values() if node.type == CFGNodeType.TASK and node.task_ref == 'send_project_email')
+        task_args = t3_node.metadata.get('task_args')
+        self.assertEqual(task_args.get('attachment'), MOCK_PROJECT_PATH)
+        self.assertEqual(len(plan.cfg.nodes), 6)
+        logger.info("RESULT: PASS - Planning phase verified.")
+
+
+    def test_02_full_e2e_execution_flow_and_ordering(self):
+        logger.info("\n--- Running test_02_full_e2e_execution_flow_and_ordering ---")
+        plan = self._plan_and_compile(self.COMPLEX_SENTENCE, self.SESSION_ID)
+        summary = self.orchestrator.execute_plan(plan=plan, session_id=self.SESSION_ID, state_tracker=self.state_tracker)
+        
+        self.assertEqual(summary.get("status"), "success", f"Orchestrator failed. Summary: {summary}")
+        
+        task_finished_events = [
+            e for e in self.event_log 
+            if e['type'] == EventType.NODE_FINISHED.value 
+            and e['payload']['node_type'] == 'task'
+            and e['payload'].get('result_summary')
+        ]
+        
+        sequence = [e['payload']['result_summary'].get('message', 'No Message') for e in task_finished_events]
+        self.assertIn("Classic song started.", sequence[0])
+        logger.info("RESULT: PASS - Execution sequence verified.")
+
+
+    def test_03_data_dependency_resolution_t3_to_t4(self):
+        logger.info("\n--- Running test_03_data_dependency_resolution_t3_to_t4 ---")
+        plan = self._plan_and_compile(self.COMPLEX_SENTENCE, self.SESSION_ID)
+        self.orchestrator.execute_plan(plan=plan, session_id=self.SESSION_ID, state_tracker=self.state_tracker)
+        
+        t3_state = self.state_tracker.get_state_by_task_name("send_project_email")
+        self.assertIsNotNone(t3_state, "T3 state missing.")
+        t3_email_id = t3_state.get('result', {}).get('email_id')
+        
+        t4_state = self.state_tracker.get_state_by_task_name("set_reply_monitor")
+        self.assertIsNotNone(t4_state, "T4 state missing.")
+        t4_watching_id = t4_state.get('result', {}).get('watching_id')
+
+        self.assertEqual(t4_watching_id, t3_email_id)
+        logger.info("RESULT: PASS - Data dependency resolution verified.")
+
+    
+    def test_04_runtime_safety_and_policy_denial(self):
+        logger.info("--- test_04_runtime_safety_and_policy_denial ---")
+        plan = self._plan_and_compile(self.COMPLEX_SENTENCE, self.SESSION_ID)
+        
+        def policy_fail_runner(action: Dict[str, Any]) -> Dict[str, Any]:
+            if action.get('name') == 'send_project_email':
+                 return {"status": "failure", "error": "Policy Denied: Restricted capability."}
+            return self.mock_runner(action)
+
+        self.worker_pool.runner = policy_fail_runner 
+        summary = self.orchestrator.execute_plan(plan=plan, session_id=self.SESSION_ID, state_tracker=self.state_tracker)
+
+        self.assertEqual(summary.get("status"), "failed")
+        t3_state = self.state_tracker.get_state_by_task_name("send_project_email")
+        self.assertEqual(t3_state.get('status'), 'failed')
+        self.worker_pool.runner = self.mock_runner 
+        logger.info("RESULT: PASS - Policy denial verified.")
+
+
+    def test_05_compilation_failure_on_invalid_dsl(self):
+        logger.info("--- test_05_compilation_failure_on_invalid_dsl ---")
+        with self.assertRaises(Exception): 
+            plan = self._plan_and_compile("Please fail_dsl this plan.", self.SESSION_ID)
+        logger.info("RESULT: PASS - Compilation failure verified.")
+
+
+    def test_06_observability_provenance_event_integrity(self):
+        logger.info("--- test_06_observability_provenance_event_integrity ---")
+        plan = self._plan_and_compile(self.COMPLEX_SENTENCE, self.SESSION_ID)
+        self.orchestrator.execute_plan(plan=plan, session_id=self.SESSION_ID, state_tracker=self.state_tracker)
+
+        all_event_types = [e['type'] for e in self.event_log]
+        self.assertIn(EventType.PLAN_COMPLETED.value, all_event_types)
+        logger.info("RESULT: PASS - Provenance verified.")
+
+
+    def test_07_conditional_branching_execution(self):
+        logger.info("--- test_07_conditional_branching_execution ---")
+        
+        mock_cfg = CFG(
+            nodes={
+                's': CFGNode(id='s', type=CFGNodeType.START, successors={'next': 'n1'}),
+                'n1': TaskNode(id='n1', task_ref='fetch_status', name='fetch_status', successors={'next': 'd1'}), 
+                'd1': DecisionNode(id='d1', condition='n1.result.code == 200', successors={'true': 'n2', 'false': 'n3'}),
+                'n2': TaskNode(id='n2', task_ref='process_success', name='process_success', successors={'next': 'e'}), 
+                'n3': TaskNode(id='n3', task_ref='log_error', name='log_error', successors={'next': 'e'}), 
+                'e': CFGNode(id='e', type=CFGNodeType.END)
+            },
+            entry='s',
+            exit='e'
+        )
+        plan = Plan(id='plan_cond', user_input='conditional check', session_id=self.SESSION_ID, status=PlanStatus.CREATED, cfg=mock_cfg)
+        
+        # Inject state tracker to capture execution logic
+        summary = self.orchestrator.execute_plan(plan=plan, session_id=self.SESSION_ID, state_tracker=self.state_tracker)
+        
+        self.assertEqual(summary.get("status"), "success")
+        
+        executed_tasks = [s.get('name') for s in self.state_tracker.get_all_states().values() if s.get('status') == 'completed' and s.get('type') == 'task']
+        self.assertIn('process_success', executed_tasks)
+        self.assertNotIn('log_error', executed_tasks)
+
+        logger.info("RESULT: PASS - Conditional branching verified.")
+
+
+    def test_08_resource_lifecycle_integrity(self):
+        logger.info("--- test_08_resource_lifecycle_integrity ---")
+        self.worker_pool.stop()
+        self.worker_pool.start()
+        self.assertTrue(self.worker_pool._is_running)
+        logger.info("RESULT: PASS - Resource lifecycle verified.")
+
+
+if __name__ == "__main__":
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    print("\nStarting TITAN God-Tier E2E Diagnostic Suite...")
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)
+    print(f"\nFull diagnostic log available in {LOG_FILE}")

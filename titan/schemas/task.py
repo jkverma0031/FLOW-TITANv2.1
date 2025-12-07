@@ -1,62 +1,61 @@
-# Path: FLOW/titan/schemas/task.py
+# Path: titan/schemas/task.py
 from __future__ import annotations
-from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field, validator
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel, Field
+from enum import Enum
 from uuid import uuid4
-import re
 
-# SECURITY: strict safe name regex
-# allow letters, numbers, underscore, 1-64 chars
-_VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+# NOTE: This file must be clean of any old imports like 'NodeType' or 'NodeBase'.
 
-
-def new_task_id(prefix: str = "t") -> str:
-    return f"{prefix}{uuid4().hex[:8]}"
-
-
-class TaskStatus:
+class TaskStatus(str, Enum):
+    """Execution status of a single Task definition."""
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
-    FAILED = "failed"
-    SKIPPED = "skipped"
+    FAILURE = "failure"
+    TIMEOUT = "timeout"
 
+def new_task_id(prefix: str = "task") -> str:
+    return f"{prefix}_{uuid4().hex[:8]}"
 
 class Task(BaseModel):
     """
-    Task model represents an abstract planner-level task.
-    Parser/adapter will convert Task -> Action[].
+    Definition for a single, actionable operation (Task) referenced by a TaskNode in the CFG.
     """
     id: str = Field(default_factory=new_task_id)
-    name: str
-    args: Dict[str, Any] = Field(default_factory=dict)
-    description: Optional[str] = None
-    timeout_seconds: Optional[int] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    status: str = Field(default=TaskStatus.PENDING)
-    created_at_iso: Optional[str] = None
-
-    class Config:
-        extra = "forbid"
-
-    @validator("name")
-    def name_must_be_sane(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Task.name must be non-empty")
-        if not _VALID_NAME_RE.match(v):
-            raise ValueError("Invalid Task.name: only letters, numbers and underscore allowed (1-64 chars)")
-        return v
-
-    def with_updated_status(self, status: str) -> "Task":
-        self.status = status
-        return self
-
-    def to_summary(self) -> Dict[str, Any]:
-        """Small summary that is safe to embed in memory."""
+    name: str = Field(description="The functional name of the task (e.g., 'list_files', 'compress').")
+    
+    # Task input arguments derived from the DSL compiler
+    arguments: Dict[str, Any] = Field(default_factory=dict, description="Input arguments for the task executor.")
+    
+    # Metadata for execution context
+    owner_node_id: Optional[str] = Field(None, description="The ID of the CFG node executing this task.")
+    status: TaskStatus = TaskStatus.PENDING
+    
+    # Optional dynamic context from runtime (e.g., trust level, file path constraints)
+    context_metadata: Dict[str, Any] = Field(default_factory=dict)
+    
+    def to_execution_request(self) -> Dict[str, Any]:
+        """Converts the Task definition into a request format consumable by the WorkerPool/Negotiator."""
         return {
-            "id": self.id,
-            "name": self.name,
-            "args": self.args,
-            "status": self.status,
-            "metadata": self.metadata,
+            "task_id": self.id,
+            "task_name": self.name,
+            "args": self.arguments,
+            "context": self.context_metadata
         }
+
+class TaskResult(BaseModel):
+    """
+    The output structure returned by the Task Executor after completion.
+    """
+    task_id: str
+    status: TaskStatus
+    success: bool = Field(description="True if the task completed successfully, false otherwise.")
+    output: Dict[str, Any] = Field(default_factory=dict, description="Structured output payload of the task.")
+    logs: Optional[str] = None
+    exit_code: Optional[int] = None
+    duration_seconds: float = 0.0
+    
+    @property
+    def is_successful(self) -> bool:
+        return self.success and self.status == TaskStatus.SUCCESS

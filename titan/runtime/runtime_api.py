@@ -18,7 +18,13 @@ class RuntimeAPI:
         self._sm = session_manager
 
     def create_session(self, owner_display_name: Optional[str] = None, ttl_seconds: Optional[int] = None) -> str:
-        return self._sm.create_session(owner_display_name=owner_display_name, ttl_seconds=ttl_seconds)
+        # NOTE: ttl_seconds is handled by initial_metadata in SessionManager.create, 
+        # but we keep the signature here for compatibility and documentation.
+        initial_metadata = {}
+        if ttl_seconds is not None:
+             initial_metadata["_ttl"] = ttl_seconds
+             
+        return self._sm.create(owner_display_name=owner_display_name, initial_metadata=initial_metadata)
 
     def get_context(self, session_id: str):
         return self._sm.get_context(session_id)

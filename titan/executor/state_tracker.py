@@ -1,56 +1,59 @@
 # Path: titan/executor/state_tracker.py
 from __future__ import annotations
 from typing import Dict, Any, Optional
-from enum import Enum
-from threading import RLock
 import time
 import logging
 
 logger = logging.getLogger(__name__)
 
-class NodeState(str, Enum):
-    PENDING = "PENDING"
-    RUNNING = "RUNNING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    SKIPPED = "SKIPPED"
-
 class StateTracker:
+    """
+    Manages the persistent state of all nodes during a single Plan execution.
+    This acts as the single source of truth for node results, status, and metadata, 
+    essential for condition evaluation and data chaining (Part 3, §5.8).
+    """
+    
     def __init__(self):
-        self._lock = RLock()
-        self._states: Dict[str, Dict[str, Any]] = {}
+        # Stores state by node ID: {node_id: {status: str, result: dict, ...}}
+        self._state: Dict[str, Dict[str, Any]] = {}
 
-    def set_state(self, node_id: str, status: NodeState, error: Optional[str] = None):
-        with self._lock:
-            if node_id not in self._states:
-                self._states[node_id] = {}
+    def initialize_node_state(self, node_id: str, name: Optional[str] = None):
+        """
+        FIX: Implements the required method to initialize a node's state to PENDING.
+        Called by the Scheduler at the start of execution.
+        """
+        if node_id not in self._state:
+            self._state[node_id] = {
+                'id': node_id,
+                'name': name,
+                'status': 'pending',
+                'started_at': None,
+                'finished_at': None,
+                'result': None,
+                'error': None,
+                'type': 'node', # Placeholder, should be set by the scheduler/node type
+            }
+        
+    def update_node_state(self, node_id: str, **kwargs):
+        """Updates the state of a specific node."""
+        if node_id not in self._state:
+            logger.warning(f"Attempted to update state for uninitialized node: {node_id}")
+            self._state[node_id] = {'id': node_id, 'status': 'unknown'}
             
-            self._states[node_id]["status"] = status
-            if error:
-                self._states[node_id]["error"] = error
-            
-            if status == NodeState.RUNNING:
-                self._states[node_id]["start_time"] = time.time()
-            elif status in [NodeState.COMPLETED, NodeState.FAILED, NodeState.SKIPPED]:
-                self._states[node_id]["end_time"] = time.time()
-
-    def set_result(self, node_id: str, result: Any):
-        with self._lock:
-            if node_id not in self._states:
-                self._states[node_id] = {}
-            self._states[node_id]["result"] = result
-            self.set_state(node_id, NodeState.COMPLETED)
+        self._state[node_id].update(kwargs)
+        
+        if kwargs.get('status') in ['completed', 'failed', 'cancelled'] and self._state[node_id].get('finished_at') is None:
+             self._state[node_id]['finished_at'] = time.time()
 
     def get_state(self, node_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._states.get(node_id)
+        """Retrieves the current state dictionary for a node."""
+        return self._state.get(node_id)
 
-    def get_result(self, node_id: str) -> Any:
-        with self._lock:
-            state = self._states.get(node_id)
-            return state.get("result") if state else None
-
-    def get_status(self, node_id: str) -> Optional[NodeState]:
-        with self._lock:
-            state = self._states.get(node_id)
-            return state.get("status") if state else None
+    def get_all_states(self) -> Dict[str, Dict[str, Any]]:
+        """Returns a snapshot of all node states."""
+        return self._state
+        
+    # Helper method for testing and dependencies (e.g., T4 looking up T3's result)
+    def get_state_by_task_name(self, task_name: str) -> Optional[Dict[str, Any]]:
+        """Retrieves the state of a node based on its friendly task name."""
+        return next((s for s in self._state.values() if s.get('name') == task_name), None)

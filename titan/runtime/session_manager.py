@@ -194,8 +194,7 @@ class SessionManager:
         autosave_interval_seconds: float = 2.0,
         sweeper_interval_seconds: float = 30.0,
         snapshot_dir: str = DEFAULT_DIR,
-        # FIX: Added autosave_context_dir to resolve API mismatch with caller (e.g., startup.py)
-        # and map it to the existing snapshot_dir, which is the correct persistence path.
+        # FIX: Correct signature to accept autosave_context_dir and map it internally.
         autosave_context_dir: Optional[str] = None,
     ):
         self.storage = storage_adapter or SQLiteStorageAdapter()
@@ -216,8 +215,11 @@ class SessionManager:
         self._sweeper_thread: Optional[threading.Thread] = None
         self._sweeper_stop = threading.Event()
 
+        # FIX: Added required runtime service attributes
         self._context_store = None
         self._trust_manager = None
+        self._identity_manager = None
+        
         self._on_session_create_hooks: List[Callable[[Dict[str, Any]], None]] = []
         self._on_session_delete_hooks: List[Callable[[str], None]] = []
 
@@ -342,6 +344,10 @@ class SessionManager:
 
     def register_trust_manager(self, trust_manager):
         self._trust_manager = trust_manager
+        
+    # FIX: Added register_identity_manager for completeness
+    def register_identity_manager(self, identity_manager):
+        self._identity_manager = identity_manager
 
     def add_on_create_hook(self, fn: Callable[[Dict[str, Any]], None]):
         self._on_session_create_hooks.append(fn)
@@ -352,20 +358,24 @@ class SessionManager:
     # -------------------------
     # Session API (CRUD)
     # -------------------------
-    def create(self, session_id: Optional[str] = None, initial_metadata: Optional[Dict[str, Any]] = None):
+    def create(self, session_id: Optional[str] = None, owner_display_name: Optional[str] = None, initial_metadata: Optional[Dict[str, Any]] = None):
         with tracer.span("session.create"):
             sid = session_id or f"session_{uuid.uuid4().hex[:8]}"
             now = time.time()
+            metadata = {
+                "_created_at": now,
+                "_last_touch": now,
+                "_ttl": self.default_ttl,
+                "_sliding": False,
+                **(initial_metadata or {}),
+            }
+            if owner_display_name:
+                metadata.setdefault("owner_display_name", owner_display_name)
+                
             data = {
                 "id": sid,
                 "_version": 1,
-                "metadata": {
-                    "_created_at": now,
-                    "_last_touch": now,
-                    "_ttl": self.default_ttl,
-                    "_sliding": False,
-                    **(initial_metadata or {}),
-                },
+                "metadata": metadata,
                 "context": {},
                 "provenance": [],
             }
@@ -448,6 +458,25 @@ class SessionManager:
             logger.info("Session deleted", extra={"session_id": session_id})
 
     # -------------------------
+    # FIX: Added missing facade methods referenced by RuntimeAPI
+    # -------------------------
+    def get_context(self, session_id: str):
+        # Retrieve the raw context payload from the session data
+        sess = self.get(session_id)
+        return sess.get("context", {}) if sess else None
+
+    def get_trust_manager(self):
+        return self._trust_manager
+
+    def get_identity_manager(self):
+        return self._identity_manager
+        
+    def end_session(self, session_id: str):
+        self.delete(session_id)
+    # -------------------------
+    
+    
+    # -------------------------
     # Provenance & Identity
     # -------------------------
     def append_provenance(self, session_id: str, entry: Dict[str, Any]):
@@ -495,7 +524,8 @@ class SessionManager:
 
                 if self._trust_manager:
                     try:
-                        self._trust_manager.enforce(session_id, sess)
+                        # NOTE: TrustManager enforces policy based on session data
+                        self._trust_manager.set_level(session_id, trust_level)
                     except Exception:
                         logger.exception("Trust enforcement failed", extra={"session_id": session_id})
 

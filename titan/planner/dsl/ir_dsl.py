@@ -27,14 +27,14 @@ class ASTTaskCall(ASTNode):
 
 @dataclass
 class ASTIf(ASTNode):
-    condition: ASTExpr = None
+    condition: Any = None
     body: List[ASTNode] = field(default_factory=list)
     orelse: List[ASTNode] = field(default_factory=list)
 
 @dataclass
 class ASTFor(ASTNode):
     iterator: str = ""
-    iterable: ASTExpr = None
+    iterable: Any = None
     body: List[ASTNode] = field(default_factory=list)
 
 @dataclass
@@ -75,19 +75,18 @@ class DSLTransformer(Transformer):
     def compound_stmt(self, items):
         return items[0]
 
-    def assignment(self, items):
-        # items: [NAME, EQ, expr] -> skip tokens
-        name = items[0].value
-        # Value is the last item usually
-        val = items[-1]
-        return ASTAssign(target=name, value=val, lineno=items[0].line)
-    
+    @v_args(inline=True)
+    def assignment(self, name, _, val):
+        # name is Token, val is ASTExpr or ASTTaskCall
+        return ASTAssign(target=name.value, value=val, lineno=name.line)
+
     def expr_stmt(self, items):
         return items[0]
 
     def if_stmt(self, items):
         # items: ["if", expr, ":", suite, ("else", ":", suite)?]
-        # Filter out tokens
+        
+        # Filtering to find condition (ASTExpr/ASTTaskCall), first body (List), second body (List)
         real_items = [x for x in items if not isinstance(x, Token)]
         
         cond = real_items[0]
@@ -99,22 +98,11 @@ class DSLTransformer(Transformer):
 
     def for_stmt(self, items):
         # items: ["for", NAME, "in", expr, ":", suite]
-        # Robust filtering:
-        # 1. Iterator name (Token)
-        # 2. Iterable (ASTExpr)
-        # 3. Body (List)
         
-        iterator = None
-        iterable = None
-        body = []
-        
-        for item in items:
-            if isinstance(item, Token) and item.type == 'NAME' and not iterator:
-                iterator = item.value
-            elif isinstance(item, ASTExpr) and not iterable:
-                iterable = item
-            elif isinstance(item, list): # The suite
-                body = item
+        # Find NAME (iterator), ASTExpr/ASTTaskCall (iterable), Body (List)
+        iterator = next(item.value for item in items if isinstance(item, Token) and item.type == 'NAME')
+        iterable = next(item for item in items if isinstance(item, (ASTExpr, ASTTaskCall, ASTValue)))
+        body = next(item for item in items if isinstance(item, list))
         
         # Line number from first token
         line = items[0].line if isinstance(items[0], Token) else None
@@ -122,75 +110,71 @@ class DSLTransformer(Transformer):
         return ASTFor(iterator=iterator, iterable=iterable, body=body, lineno=line)
 
     def retry_stmt(self, items):
+        # items: ["retry", "attempts", EQ, NUMBER, ("backoff", EQ, NUMBER)?, ":", suite]
+        
         attempts = 3
         backoff = 1.0
-        body = items[-1] # Body is always last
         
-        for i, item in enumerate(items):
-            if isinstance(item, Token) and item.type == 'NUMBER':
-                # First number is attempts, second is backoff
-                if "attempts" in str(items[i-2]): attempts = int(item.value)
-                if "backoff" in str(items[i-2]): backoff = float(item.value)
+        # Find all numbers
+        numbers = [float(item.value) for item in items if isinstance(item, Token) and item.type == 'NUMBER']
+        
+        # By grammar definition: first number is attempts, second (if present) is backoff
+        if len(numbers) >= 1: attempts = int(numbers[0])
+        if len(numbers) >= 2: backoff = numbers[1]
+        
+        body = items[-1] # Body is always last
                 
-        return ASTRetry(attempts=attempts, backoff=backoff, body=body)
+        return ASTRetry(attempts=attempts, backoff=backoff, body=body, lineno=items[0].line)
 
     def suite(self, items):
         # Filter tokens (INDENT/DEDENT/NEWLINE)
-        return [x for x in items if isinstance(x, (ASTNode, list))] 
+        result = []
+        for x in items:
+            if isinstance(x, (ASTNode, list)): 
+                result.append(x)
+        return result
 
-    # Expression Reconstructors
-    def _reconstruct(self, items):
-        if len(items) == 1 and isinstance(items[0], ASTTaskCall):
-            return items[0]
-
+    # Expression Reconstructors - Simplified for robustness
+    @v_args(inline=True)
+    def _reconstruct(self, *items):
+        # Combine all parts into a single string for ASTExpr.text
         parts = []
         line = None
-        for it in items:
-            if isinstance(it, ASTExpr): 
-                parts.append(it.text)
-                if not line: line = it.lineno
-            elif isinstance(it, ASTTaskCall):
-                parts.append(it.name) # Fallback if inside complex expr
-                if not line: line = it.lineno
-            elif isinstance(it, ASTValue):
-                parts.append(str(it.value))
-                if not line: line = it.lineno
-            elif isinstance(it, Token):
-                parts.append(it.value)
-                if not line: line = it.line
-            else:
-                parts.append(str(it))
-        return ASTExpr(text=" ".join(parts).replace(" . ", "."), lineno=line)
+        for item in items:
+            if isinstance(item, Token):
+                parts.append(item.value)
+                if not line: line = item.line
+            elif isinstance(item, ASTExpr):
+                parts.append(item.text)
+                if not line: line = item.lineno
+            elif isinstance(item, (ASTTaskCall, ASTValue)):
+                # Handle nested TaskCall/ASTValue in expressions by taking their text/value
+                val_text = getattr(item, 'text', str(getattr(item, 'value', '')))
+                parts.append(val_text)
+                if not line: line = getattr(item, 'lineno', line)
 
-    def or_test(self, items): return self._reconstruct(items)
-    def and_test(self, items): return self._reconstruct(items)
-    def comparison(self, items): return self._reconstruct(items)
-    def attr_access(self, items): 
-        # Special handling to join dots without spaces
-        if len(items) == 1 and isinstance(items[0], ASTTaskCall): return items[0]
-        parts = []
-        line = None
-        for it in items:
-            if isinstance(it, Token):
-                parts.append(it.value)
-                if not line: line = it.line
-            elif isinstance(it, ASTExpr):
-                parts.append(it.text)
-                if not line: line = it.lineno
-            elif isinstance(it, ASTTaskCall):
-                parts.append(it.name)
-        return ASTExpr(text="".join(parts), lineno=line)
+        # Connect dot notation and normalize spacing for robust evaluation
+        text = " ".join(parts)
+        text = text.replace(" . ", ".").replace(" .", ".").replace(". ", ".")
+        text = text.replace(" == ", "==").replace(" != ", "!=").strip()
+        
+        # Attempt to get a line number
+        return ASTExpr(text=text, lineno=line)
+
+    def or_test(self, items): return self._reconstruct(*items)
+    def and_test(self, items): return self._reconstruct(*items)
+    def comparison(self, items): return self._reconstruct(*items)
+    
+    @v_args(inline=True)
+    def attr_access(self, *items):
+        return self._reconstruct(*items)
 
     def expr(self, items): return items[0]
 
     def call_expr(self, items):
         name = items[0].value
-        # args is the second item if present (index 1), skipping LPAR
-        # items: [NAME, LPAR, arg_list, RPAR] -> filter tokens
-        args = {}
-        for it in items:
-            if isinstance(it, dict): args = it
-            
+        # args is a dictionary (from arg_list rule)
+        args = next((item for item in items if isinstance(item, dict)), {})
         return ASTTaskCall(name=name, args=args, lineno=items[0].line)
 
     def arg_list(self, items):
@@ -199,9 +183,10 @@ class DSLTransformer(Transformer):
             if isinstance(item, dict): args.update(item)
         return args
 
-    def keyword_arg(self, items):
-        # items: [NAME, EQ, expr]
-        return {items[0].value: items[2]}
+    @v_args(inline=True)
+    def keyword_arg(self, name, _, val):
+        # name is Token, val is ASTExpr or ASTValue
+        return {name.value: val}
 
     def positional_arg(self, items):
         return {}
@@ -209,17 +194,25 @@ class DSLTransformer(Transformer):
     def atom(self, items):
         item = items[0]
         if isinstance(item, ASTTaskCall): return item
-        if isinstance(item, Token): return ASTExpr(text=item.value, lineno=item.line)
-        return item
+        if isinstance(item, ASTValue): return item
+        if isinstance(item, ASTExpr): return item # For paren-wrapped expressions
+        return item 
 
-    def value(self, items):
+    # NEW RULES from grammar.lark (Value definitions)
+    def string_value(self, items):
         item = items[0]
-        if item.type == 'ESCAPED_STRING': return ASTValue(value=item.value[1:-1], lineno=item.line)
-        elif item.type == 'NUMBER':
-            try: return ASTValue(value=int(item.value))
-            except: return ASTValue(value=float(item.value))
-        elif item.type == 'NAME': return ASTExpr(text=item.value, lineno=item.line)
-        return ASTValue(value=item.value, lineno=item.line)
+        return ASTValue(value=item.value[1:-1], lineno=item.line)
+        
+    def number_value(self, items):
+        item = items[0]
+        try: return ASTValue(value=int(item.value), lineno=item.line)
+        except ValueError: return ASTValue(value=float(item.value), lineno=item.line)
+        
+    def name_value(self, items):
+        item = items[0]
+        # Represents a variable name being used as a literal value in an argument
+        return ASTExpr(text=item.value, lineno=item.line)
+
 
 # --- 4. Parser Init ---
 _grammar_path = os.path.join(os.path.dirname(__file__), "grammar.lark")
@@ -229,5 +222,6 @@ with open(_grammar_path, "r") as f:
 PARSER = Lark(_grammar, parser="lalr", lexer="contextual", postlex=DSLIndenter(), start="start")
 
 def parse_dsl(code: str) -> ASTRoot:
+    # Lark requires an extra newline at the end of the source string for the indenter to output a DEDENT token at EOF.
     tree = PARSER.parse(code + "\n")
     return DSLTransformer().transform(tree)

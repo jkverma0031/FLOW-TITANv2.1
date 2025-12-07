@@ -1,26 +1,29 @@
 # Path: titan/executor/scheduler.py
 from __future__ import annotations
-from typing import List, Dict, Set, Optional, Any
+from typing import Dict, Any, Optional, Callable, List
 import logging
-import asyncio
+import time
 from datetime import datetime
 
-from titan.schemas.graph import CFG, NodeType, NodeBase
+from titan.schemas.plan import Plan
+from titan.schemas.graph import CFG, CFGNode, CFGNodeType, DecisionNode, TaskNode, LoopNode, RetryNode
 from titan.schemas.events import Event, EventType
-# FIXED: Import NodeState
-from titan.executor.state_tracker import StateTracker, NodeState
-from titan.executor.condition_evaluator import ConditionEvaluator
-from titan.executor.loop_engine import LoopEngine
-from titan.executor.retry_engine import RetryEngine
-from titan.executor.replanner import Replanner
-from titan.executor.worker_pool import WorkerPool
+
+from .state_tracker import StateTracker
+from .worker_pool import WorkerPool
+from .condition_evaluator import ConditionEvaluator
+from .loop_engine import LoopEngine
+from .retry_engine import RetryEngine
+from .replanner import Replanner
 
 logger = logging.getLogger(__name__)
 
 class Scheduler:
     """
-    Determines which nodes are ready to execute based on the CFG and current State.
+    The brain of the CFG-VM. Determines which nodes are ready to run,
+    enforces control flow transitions, and orchestrates the execution engines.
     """
+
     def __init__(
         self,
         cfg: CFG,
@@ -29,125 +32,156 @@ class Scheduler:
         condition_evaluator: ConditionEvaluator,
         loop_engine: LoopEngine,
         retry_engine: RetryEngine,
-        replanner: Optional[Replanner],
-        event_emitter: Optional[Any] = None
+        replanner: Optional[Replanner] = None,
+        event_emitter: Optional[Callable[[Event], None]] = None,
     ):
         self.cfg = cfg
-        self.pool = worker_pool
+        self.worker_pool = worker_pool
         self.state = state_tracker
         self.cond_eval = condition_evaluator
-        self.loop_engine = loop_engine
-        self.retry_engine = retry_engine
+        self.loop_eng = loop_engine
+        self.retry_eng = retry_engine
         self.replanner = replanner
-        self.emit = event_emitter if event_emitter else lambda e: None
+        self.event_emitter = event_emitter
+        
+        self._nodes_to_process: List[str] = []
+        self._finished = False
+        
+        # Initialize state for all nodes
+        for node_id, node in self.cfg.nodes.items():
+            self.state.initialize_node_state(node_id, name=node.name) 
+            
+        if self.cfg.entry:
+            self._nodes_to_process.append(self.cfg.entry)
 
-    def run(self, session_id: str, plan_id: str) -> Dict[str, Any]:
-        """
-        Main execution loop.
-        """
-        logger.info("Scheduler: starting execution")
+
+    def _emit(self, event_type: EventType, plan_id: str, payload: Dict[str, Any]):
+        """Helper for emitting events."""
+        if self.event_emitter:
+            try:
+                event = Event(
+                    type=event_type,
+                    plan_id=plan_id,
+                    payload=payload,
+                )
+                self.event_emitter(event)
+            except Exception as e:
+                logger.error(f"Failed to emit event {event_type}: {e}")
+
+    def _get_node(self, node_id: str) -> CFGNode:
+        node = self.cfg.nodes.get(node_id)
+        if not node:
+            raise KeyError(f"Node ID {node_id} not found in CFG.")
+        return node
+        
+    def _is_node_ready(self, node_id: str) -> bool:
+        state = self.state.get_state(node_id)
+        if state and state.get('status') in ['completed', 'failed', 'running']:
+            return False
+        return True
+
+    def _process_node(self, node_id: str, session_id: str, plan_id: str):
+        """Processes a single node based on its type."""
+        
+        node = self._get_node(node_id)
+        self._emit(EventType.NODE_STARTED, plan_id, {"node_id": node.id, "node_type": node.type.value})
+        
+        # FIX: Explicitly update 'type' in StateTracker so tests can filter by 'task'
+        self.state.update_node_state(
+            node_id, 
+            status='running', 
+            type=node.type.value, 
+            started_at=time.time()
+        )
+        
+        result: Optional[Dict[str, Any]] = None
         
         try:
-            self.cfg.validate_integrity()
-        except Exception as e:
-            return {"status": "failed", "error": f"Graph integrity check failed: {e}"}
-
-        # Initialize State
-        for nid in self.cfg.nodes:
-            self.state.set_state(nid, NodeState.PENDING)
-
-        queue = [self.cfg.entry]
-        visited = set()
-
-        while queue:
-            current_id = queue.pop(0)
-            
-            if current_id in visited:
-                continue
-            
-            node = self.cfg.nodes[current_id]
-            
-            # Emit Node Started
-            self.emit(Event(
-                type=EventType.NODE_STARTED,
-                plan_id=plan_id,
-                payload={
-                    "node_id": node.id,
-                    "node_type": node.type,
-                    "timestamp": datetime.utcnow().isoformat()
+            # --- 1. ACTION NODE EXECUTION (TASK/CALL) ---
+            if node.type in [CFGNodeType.TASK, CFGNodeType.CALL]:
+                task_node: TaskNode = node 
+                
+                action_request = {
+                    "id": task_node.id,
+                    "name": task_node.task_ref,
+                    "args": task_node.metadata.get('task_args', {}),
+                    "context": {"session_id": session_id, "plan_id": plan_id, "task_name": task_node.task_ref}
                 }
-            ))
-
-            # EXECUTE NODE
-            try:
-                # Mark as Running
-                self.state.set_state(node.id, NodeState.RUNNING)
                 
-                result = self._execute_node(node)
-                self.state.set_result(node.id, result)
+                result = self.worker_pool.runner(action_request)
                 
-                # Emit Node Finished
-                self.emit(Event(
-                    type=EventType.NODE_FINISHED,
-                    plan_id=plan_id,
-                    payload={
-                        "node_id": node.id,
-                        "result": result,
-                        "timestamp": datetime.utcnow().isoformat()
-                    }
-                ))
-            except Exception as e:
-                self.state.set_state(node.id, NodeState.FAILED, str(e))
-                logger.exception(f"Node {node.id} failed")
-                return {"status": "failed", "error": str(e), "failed_node": node.id}
+                if result and result.get('status') == 'failure':
+                    self.state.update_node_state(node_id, status='failed', result=result, error=result.get('error'))
+                    self._emit(EventType.ERROR_OCCURRED, plan_id, {"node_id": node.id, "error": result.get('error'), "is_action_failure": True})
+                    return
 
-            visited.add(current_id)
+                self.state.update_node_state(node_id, status='completed', result=result)
+                self._emit(EventType.NODE_FINISHED, plan_id, {"node_id": node.id, "node_type": node.type.value, "result_summary": result})
+                self._transition_to_successors(node, 'next')
+                
+            # --- 2. CONTROL FLOW NODES ---
+            elif node.type == CFGNodeType.DECISION:
+                decision_node: DecisionNode = node 
+                condition = decision_node.condition
+                
+                resolver_fn = lambda name: self.cond_eval.resolver(name, self.state)
+                evaluator = ConditionEvaluator(resolver=resolver_fn) 
+                
+                eval_result = evaluator.evaluate(condition)
+                
+                successor_label = 'true' if eval_result else 'false'
+                if successor_label not in node.successors:
+                    successor_label = 'next'
+                
+                self._emit(EventType.DECISION_TAKEN, plan_id, {"node_id": node.id, "condition": condition, "result": eval_result, "branch": successor_label})
+                self.state.update_node_state(node_id, status='completed', result={"branch_taken": successor_label})
 
-            next_ids = self._get_next_nodes(node, result)
-            for nid in next_ids:
-                if nid not in visited and nid not in queue:
-                    queue.append(nid)
+                self._transition_to_successors(node, successor_label)
+                self._emit(EventType.NODE_FINISHED, plan_id, {"node_id": node.id, "node_type": node.type.value})
+                
+            elif node.type in [CFGNodeType.START, CFGNodeType.NOOP]:
+                self.state.update_node_state(node_id, status='completed')
+                self._emit(EventType.NODE_FINISHED, plan_id, {"node_id": node.id, "node_type": node.type.value})
+                self._transition_to_successors(node, 'next')
 
-            if node.type == NodeType.END:
-                break
+            elif node.type == CFGNodeType.END:
+                self.state.update_node_state(node_id, status='completed')
+                self._emit(EventType.NODE_FINISHED, plan_id, {"node_id": node.id, "node_type": node.type.value})
+                self._finished = True 
+                
+        except Exception as e:
+            logger.exception(f"CRITICAL ERROR processing node {node_id}")
+            self.state.update_node_state(node_id, status='failed', error=str(e))
+            self._emit(EventType.ERROR_OCCURRED, plan_id, {"node_id": node.id, "error": str(e), "critical": True}) 
+            self._finished = True
 
-        return {"status": "success", "nodes_executed": len(visited)}
+    def _transition_to_successors(self, node: CFGNode, label: str):
+        target_id = node.successors.get(label)
+        if target_id:
+            if target_id not in self._nodes_to_process:
+                self._nodes_to_process.append(target_id)
+            logger.debug(f"TRANSITION: Node {node.id} -> {target_id} via label '{label}'")
+        elif not node.successors and node.type != CFGNodeType.END:
+            logger.warning(f"Node {node.id} is a terminal node but not of type END.")
 
-    def _execute_node(self, node: NodeBase) -> Any:
-        if node.type == NodeType.TASK:
-            payload = {
-                "type": "exec",
-                "command": f"mock_execute {node.name}",
-                "args": node.metadata,
-                "timeout_seconds": getattr(node, "timeout_seconds", 60)
-            }
-            future = self.pool.submit(payload)
-            return future.result()
-
-        elif node.type == NodeType.DECISION:
-            return self.cond_eval.evaluate(node.condition)
-
-        elif node.type == NodeType.LOOP:
-            return self.loop_engine.should_continue(node)
-
-        elif node.type == NodeType.RETRY:
-            return True
-
-        elif node.type == NodeType.START or node.type == NodeType.END or node.type == NodeType.NOOP:
-            return {"status": "ok"}
-            
-        return None
-
-    def _get_next_nodes(self, node: NodeBase, result: Any) -> List[str]:
-        edges = self.cfg.get_edges_from(node.id)
+    def run(self, session_id: str, plan_id: str) -> Dict[str, Any]:
+        self._finished = False
+        nodes_executed = 0
         
-        if node.type == NodeType.DECISION:
-            label = "true" if result else "false"
-            return [e.target for e in edges if e.label == label]
+        while self._nodes_to_process and not self._finished:
+            current_node_id = self._nodes_to_process.pop(0)
             
-        elif node.type == NodeType.LOOP:
-            target_labels = ["body", "continue"] if result else ["break"]
-            return [e.target for e in edges if e.label in target_labels]
+            if self._is_node_ready(current_node_id):
+                self._process_node(current_node_id, session_id, plan_id)
+                nodes_executed += 1
             
+            if nodes_executed > 1000:
+                logger.error("Scheduler hit maximum execution limit. Potential infinite loop detected.")
+                self._finished = True
+                
+        end_state = self.state.get_state(self.cfg.exit)
+        if end_state and end_state.get('status') == 'completed':
+            return {"status": "success", "nodes_executed": nodes_executed}
         else:
-            return [e.target for e in edges]
+            critical_error = next((s.get('error') for s in self.state.get_all_states().values() if s.get('status') == 'failed'), "Execution halted unexpectedly.")
+            return {"status": "failed", "nodes_executed": nodes_executed, "message": critical_error}
