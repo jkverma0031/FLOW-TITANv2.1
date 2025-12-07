@@ -1,0 +1,64 @@
+%declare INDENT DEDENT
+%import common.NEWLINE
+%import common.CNAME -> NAME
+%import common.SIGNED_NUMBER -> NUMBER
+%import common.ESCAPED_STRING
+%import common.WS_INLINE
+
+%ignore WS_INLINE
+%ignore /#[^\n]*/
+
+start: NEWLINE* stmt_list
+
+stmt_list: (stmt)+
+
+# -------------------------------------
+# Statement = assignment OR expression
+# -------------------------------------
+?stmt: assignment NEWLINE
+     | expr NEWLINE
+     | compound_stmt
+
+assignment: NAME "=" expr
+
+compound_stmt: if_stmt
+             | for_stmt
+             | retry_stmt
+
+# -------------------------------------
+# Calls
+# -------------------------------------
+call_expr: NAME "(" [arg_list] ")"
+
+arg_list: arg ("," arg)* [","]
+arg: NAME "=" value      -> keyword_arg
+   | value               -> positional_arg
+
+# -------------------------------------
+# IF / FOR / RETRY
+# -------------------------------------
+if_stmt: "if" expr ":" NEWLINE INDENT stmt_list DEDENT("else" ":" NEWLINE INDENT stmt_list DEDENT)?
+
+for_stmt: "for" NAME "in" expr ":" NEWLINE INDENT stmt_list DEDENT
+
+retry_stmt: "retry" "attempts" "=" NUMBER["backoff" "=" NUMBER]":" NEWLINE INDENT stmt_list DEDENT
+
+# -------------------------------------
+# Expression Grammar
+# -------------------------------------
+?expr: or_test
+
+or_test: and_test ("or" and_test)*
+and_test: comparison ("and" comparison)*
+
+comparison: atom (("==" | "!=" | "<" | ">" | "<=" | ">=" | "in") atom)*
+
+atom: call_expr
+    | NAME
+    | NUMBER
+    | ESCAPED_STRING
+    | "(" expr ")"
+
+value: ESCAPED_STRING -> string
+     | NUMBER         -> number
+     | NAME           -> name

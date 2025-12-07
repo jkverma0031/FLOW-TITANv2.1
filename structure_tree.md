@@ -15,10 +15,13 @@ FLOW/
 │
 ├─ titan/
 │  ├─ kernel/
-│  │  ├─ kernel.py
-│  │  ├─ dispatcher.py
-│  │  ├─ lifecycle.py
-│  │  └─ events.py
+│  │  ├── kernel.py                   
+│  │  ├── app_context.py              
+│  │  ├── lifecycle.py                
+│  │  ├── diagnostics.py             
+│  │  ├── capability_registry.py     
+│  │  ├── event_bus.py               
+│  │  └── startup.py 
 │  │
 │  ├─ planner/
 │  │  ├─ planner.py
@@ -68,6 +71,8 @@ FLOW/
 │  │
 │  ├─ runtime/
 │  │  ├─ session_manager.py
+│  │  ├─ identity.py
+│  │  ├─ runtime_api.py
 │  │  ├─ context_store.py
 │  │  └─ trust_manager.py
 │  │
