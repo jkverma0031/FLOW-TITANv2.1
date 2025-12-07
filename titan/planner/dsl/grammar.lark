@@ -5,6 +5,9 @@
 %import common.ESCAPED_STRING
 %import common.WS_INLINE
 
+// FIX: Define DOT as a standard terminal to resolve the GrammarError.
+DOT: "."
+
 %ignore WS_INLINE
 %ignore /#[^\n]*/
 
@@ -31,14 +34,14 @@ compound_stmt: if_stmt
 call_expr: NAME "(" [arg_list] ")"
 
 arg_list: arg ("," arg)* [","]
-arg: NAME "=" value      -> keyword_arg
-   | value               -> positional_arg
+
+arg: NAME "=" expr      -> keyword_arg
+   | expr               -> positional_arg
 
 # -------------------------------------
 # IF / FOR / RETRY
 # -------------------------------------
 if_stmt: "if" expr ":" NEWLINE INDENT stmt_list DEDENT("else" ":" NEWLINE INDENT stmt_list DEDENT)?
-
 for_stmt: "for" NAME "in" expr ":" NEWLINE INDENT stmt_list DEDENT
 
 retry_stmt: "retry" "attempts" "=" NUMBER["backoff" "=" NUMBER]":" NEWLINE INDENT stmt_list DEDENT
@@ -51,7 +54,10 @@ retry_stmt: "retry" "attempts" "=" NUMBER["backoff" "=" NUMBER]":" NEWLINE INDEN
 or_test: and_test ("or" and_test)*
 and_test: comparison ("and" comparison)*
 
-comparison: atom (("==" | "!=" | "<" | ">" | "<=" | ">=" | "in") atom)*
+comparison: attr_access (("==" | "!=" | "<" | ">" | "<=" | ">=" | "in") attr_access)*
+
+# Allow dot notation for result/variable access (e.g., t1.result.ok)
+attr_access: atom (DOT NAME)*
 
 atom: call_expr
     | NAME

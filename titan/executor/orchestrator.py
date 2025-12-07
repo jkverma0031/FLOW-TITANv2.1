@@ -94,6 +94,7 @@ class Orchestrator:
             retry_eng = RetryEngine()
             replanner = Replanner(replanner_fn) if replanner_fn else None
 
+            # FIX: Updated to use keyword arguments for Scheduler instantiation
             scheduler = Scheduler(
                 cfg=cfg,
                 worker_pool=worker_pool,

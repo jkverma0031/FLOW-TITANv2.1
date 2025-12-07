@@ -1,7 +1,7 @@
 # Path: titan/policy/engine.py
 from __future__ import annotations
 import logging
-from typing import Any, Dict, Optional, Callable, Iterable
+from typing import Any, Dict, Optional, Callable, Iterable, Union, List
 
 logger = logging.getLogger(__name__)
 
@@ -75,27 +75,64 @@ class PolicyEngine:
         # 3) default deny
         return PolicyDecision(False, reason="no rule allowed this action", details={})
 
-    # ----- Utilities: some common rule factories -----
+    # ----- Utilities: common rule factories and helper for deep scanning -----
+    @staticmethod
+    def _recursively_check_for_forbidden_strings(data: Union[Dict, List, Any], forbidden: List[str]) -> Optional[str]:
+        """Recursively checks dicts, lists, and strings for forbidden substrings."""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                # Check keys as well, although primary target is value
+                if any(f in str(key).lower() for f in forbidden):
+                    return f"forbidden token matched in key: {key}"
+                res = PolicyEngine._recursively_check_for_forbidden_strings(value, forbidden)
+                if res:
+                    return res
+        elif isinstance(data, list):
+            for item in data:
+                res = PolicyEngine._recursively_check_for_forbidden_strings(item, forbidden)
+                if res:
+                    return res
+        elif isinstance(data, (str, bytes)):
+            txt = str(data).lower()
+            for f in forbidden:
+                if f in txt:
+                    return f"forbidden token matched in value: {f}"
+        return None
+
     @staticmethod
     def rule_deny_if_command_contains_forbidden(forbidden: Iterable[str]):
-        forbidden = [f.lower() for f in forbidden]
+        # Convert all forbidden strings to lowercase list once
+        forbidden_list = [f.lower() for f in forbidden]
 
         def rule(ctx: dict) -> Optional[PolicyDecision]:
             action = ctx.get("action")
-            # action may be pydantic model or dict
+            
+            # Extract main command/payload
             cmd = None
             if isinstance(action, dict):
                 cmd = action.get("command") or action.get("payload")
             else:
-                # try attribute access
+                # try attribute access (e.g., if action is Pydantic model)
                 cmd = getattr(action, "command", None) or getattr(action, "payload", None)
-            if cmd is None:
-                return None
-            # string check
-            txt = str(cmd).lower()
-            for f in forbidden:
-                if f in txt:
-                    return PolicyDecision(False, reason=f"forbidden token matched: {f}")
+
+            # Check main command/payload
+            if cmd is not None:
+                if PolicyEngine._recursively_check_for_forbidden_strings(cmd, forbidden_list):
+                    return PolicyDecision(False, reason="forbidden token matched in command/payload")
+
+            # SECURITY FIX: Recursively check action arguments (e.g., injected args in a dictionary)
+            action_args = None
+            if isinstance(action, dict):
+                action_args = action.get("args")
+            else:
+                action_args = getattr(action, "args", None)
+            
+            if action_args:
+                res = PolicyEngine._recursively_check_for_forbidden_strings(action_args, forbidden_list)
+                if res:
+                    # Return the reason found during recursive check
+                    return PolicyDecision(False, reason=f"forbidden token matched in action arguments: {res}")
+            
             return None
 
         return rule

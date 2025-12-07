@@ -30,6 +30,7 @@ class Scheduler:
 
     def __init__(
         self,
+        *,  # Enforce all following arguments to be keyword-only (Best Practice Improvement)
         cfg: CFG,
         worker_pool: WorkerPool,
         state_tracker: StateTracker,
@@ -315,6 +316,9 @@ class Scheduler:
                 if not child_node:
                     return {"success": False, "error": "child_node_missing"}
                 if child_node.type == NodeType.TASK:
+                    # NOTE: Passing empty string for session_id/plan_id inside loop/retry execution
+                    # might be acceptable for internal steps, but should probably pass the real IDs.
+                    # This is how the original code was structured.
                     return self._execute_task_node(child_node, session_id="", plan_id=plan_id)
                 return {"success": False, "error": "unsupported_retry_child_type"}
 

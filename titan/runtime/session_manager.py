@@ -194,12 +194,16 @@ class SessionManager:
         autosave_interval_seconds: float = 2.0,
         sweeper_interval_seconds: float = 30.0,
         snapshot_dir: str = DEFAULT_DIR,
+        # FIX: Added autosave_context_dir to resolve API mismatch with caller (e.g., startup.py)
+        # and map it to the existing snapshot_dir, which is the correct persistence path.
+        autosave_context_dir: Optional[str] = None,
     ):
         self.storage = storage_adapter or SQLiteStorageAdapter()
         self.default_ttl = default_ttl_seconds
         self.autosave_interval = autosave_interval_seconds
         self.sweeper_interval = sweeper_interval_seconds
-        self.snapshot_dir = snapshot_dir
+        # Use provided autosave_context_dir if given, otherwise use snapshot_dir default
+        self.snapshot_dir = autosave_context_dir or snapshot_dir
         os.makedirs(self.snapshot_dir, exist_ok=True)
 
         self._sessions: Dict[str, Dict[str, Any]] = {}
