@@ -1,3 +1,4 @@
 Hii flow, i am quite busy today so tell me about important mails if there is any. And before that please play a classic song. After that I will sleep so set an alarm for 5pm. Also when i wake up and talk to you tell me about the important meeting.
 
 
+Hii Flow today i am quite busy because i have to complete the presentation slides. So open the presentation file we were working on yesterday and before that play a classic song. When we complete the whole presentation send it to Mr.X and tell him the core idea of the presentation then call him and ask if it is good or not. At the end let me know it everything goes right. If presentation is not made then reschedule the meeting.

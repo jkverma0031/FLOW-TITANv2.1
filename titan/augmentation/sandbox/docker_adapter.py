@@ -1,73 +1,94 @@
-# Path: FLOW/titan/augmentation/sandbox/docker_adapter.py
+# titan/augmentation/sandbox/docker_adapter.py
 from __future__ import annotations
+import asyncio
 import subprocess
-import tempfile
-import os
-import time
 import uuid
 import logging
-from typing import Dict, Any, Optional
+import time
+from typing import Optional
+
+from titan.augmentation.sandbox.sandbox_runner import ExecutionResult
 
 logger = logging.getLogger(__name__)
 
 MANAGED_LABEL_KEY = "managed_by"
 MANAGED_LABEL_VALUE = "titan"
 
-
 class DockerAdapter:
-    def __init__(self, image="python:3.11-slim", work_dir="/work", timeout=60):
+    """
+    Async-friendly Docker Adapter:
+    - run_command_async uses loop.run_in_executor (since docker CLI is blocking)
+    - Ensures container cleanup
+    """
+
+    def __init__(self, image: str = "python:3.11-slim", work_dir: str = "/work", timeout: int = 60):
         self.image = image
         self.work_dir = work_dir
         self.timeout = timeout
 
-    def available(self) -> bool:
+    def start(self):
+        # no persistent background tasks; optionally check docker availability
         try:
-            subprocess.check_call(["docker", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
+            subprocess.run(["docker", "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         except Exception:
-            return False
+            logger.debug("Docker CLI may be unavailable")
 
-    def run(self, cmd: str, files: Optional[Dict[str, bytes]] = None, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def _create_container(self) -> Optional[str]:
+        container_name = f"titan_{uuid.uuid4().hex[:8]}"
+        cmd = [
+            "docker", "run", "--rm", "-d",
+            "--label", f"{MANAGED_LABEL_KEY}={MANAGED_LABEL_VALUE}",
+            "-w", self.work_dir,
+            "--entrypoint", "/bin/sh",
+            self.image,
+            "-c", "sleep 3600"
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if proc.returncode != 0:
+                logger.warning("DockerAdapter: create container failed: %s", proc.stderr.decode("utf-8", errors="replace"))
+                return None
+            return proc.stdout.decode("utf-8", errors="replace").strip().splitlines()[0]
+        except Exception:
+            logger.exception("DockerAdapter._create_container failed")
+            return None
+
+    def _remove_container(self, cid: str):
+        try:
+            subprocess.run(["docker", "rm", "-f", cid], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        except Exception:
+            logger.exception("DockerAdapter._remove_container failed")
+
+    async def run_command_async(self, command: str, timeout: int = None, work_dir: Optional[str] = None) -> ExecutionResult:
         timeout = timeout or self.timeout
         start = time.time()
-        container_name = f"titan_{uuid.uuid4().hex[:8]}"
-
-        with tempfile.TemporaryDirectory(prefix="titan_docker_") as tmpdir:
-            if files:
-                for name, content in files.items():
-                    path = os.path.join(tmpdir, name)
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    with open(path, "wb") as fh:
-                        fh.write(content)
-
-            cmd_list = [
-                "docker", "run", "--name", container_name,
-                "--label", f"{MANAGED_LABEL_KEY}={MANAGED_LABEL_VALUE}",
-                "--rm",
-                "-v", f"{tmpdir}:{self.work_dir}",
-                "-w", self.work_dir,
-                self.image,
-                "/bin/sh", "-lc", cmd
-            ]
-
+        cid = None
+        loop = asyncio.get_event_loop()
+        try:
+            cid = await loop.run_in_executor(None, self._create_container)
+            if not cid:
+                return ExecutionResult({"success": False, "stdout": "", "stderr": "failed to create container", "exit_code": -1, "duration": 0.0})
+            exec_cmd = ["docker", "exec", "--tty", cid, "sh", "-c", command]
+            proc = await loop.run_in_executor(None, lambda: subprocess.Popen(exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
             try:
-                proc = subprocess.Popen(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=(os.environ | (env or {})))
-                out, err = proc.communicate(timeout=timeout)
-                stdout_text = out.decode("utf-8", errors="replace")
-                stderr_text = err.decode("utf-8", errors="replace")
+                stdout, stderr = await loop.run_in_executor(None, lambda: proc.communicate(timeout=timeout))
                 exit_code = proc.returncode
+                stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
+                stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
             except subprocess.TimeoutExpired:
                 proc.kill()
                 stdout_text, stderr_text, exit_code = "", "timeout", -1
-            except Exception as e:
-                logger.exception("DockerAdapter run error")
-                stdout_text, stderr_text, exit_code = "", str(e), -1
+            return ExecutionResult({"success": exit_code == 0, "stdout": stdout_text, "stderr": stderr_text, "exit_code": exit_code, "container_id": cid, "duration": time.time() - start})
+        except Exception as e:
+            logger.exception("DockerAdapter.run_command_async error")
+            return ExecutionResult({"success": False, "stdout": "", "stderr": str(e), "exit_code": -1, "duration": time.time() - start})
+        finally:
+            if cid:
+                try:
+                    await loop.run_in_executor(None, lambda: self._remove_container(cid))
+                except Exception:
+                    pass
 
-        return {
-            "success": exit_code == 0,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "exit_code": exit_code,
-            "container_name": container_name,
-            "duration": time.time() - start,
-        }
+    def run_command(self, command: str, timeout: int = None):
+        # sync fallback
+        return asyncio.get_event_loop().run_until_complete(self.run_command_async(command, timeout=timeout))

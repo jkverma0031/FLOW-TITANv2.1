@@ -1,11 +1,13 @@
-# Path: titan/augmentation/negotiator.py
+# titan/augmentation/negotiator.py
 from __future__ import annotations
-from typing import Optional, Dict, List, Any
+import asyncio
 import logging
+from typing import Optional, Dict, Any
+
 from titan.schemas.action import Action, ActionType
+from titan.runtime.plugins.registry import get_plugin
 
 logger = logging.getLogger(__name__)
-
 
 class NegotiationDecision:
     def __init__(self, provider: str, reason: str, metadata: Optional[dict] = None):
@@ -13,88 +15,98 @@ class NegotiationDecision:
         self.reason = reason
         self.metadata = metadata or {}
 
-    def __repr__(self):
-        return f"<NegotiationDecision provider={self.provider} reason={self.reason}>"
-
+    def __repr__(self) -> str:
+        return f"NegotiationDecision(provider={self.provider!r}, reason={self.reason!r}, metadata={self.metadata!r})"
 
 class Negotiator:
     """
-    Enterprise-grade negotiator.
-    Decides WHO runs the action (Sandbox, HostBridge, Plugin) and then EXECUTUTES it.
+    Async-capable Negotiator:
+      - Decides provider candidate for an Action
+      - Consults a PolicyEngine (async if available)
     """
 
-    def __init__(self, capability_registry, policy_engine=None):
-        self.registry = capability_registry
-        self.policy = policy_engine
+    def __init__(self, hostbridge=None, sandbox=None, policy_engine: Optional[Any] = None):
+        self.hostbridge = hostbridge
+        self.sandbox = sandbox
+        self.policy_engine = policy_engine
 
-    def choose_and_execute(self, action_payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _policy_allow(self, actor: str, trust: str, action_name: str, resource: dict) -> tuple:
         """
-        The main entry point for the Orchestrator/WorkerPool.
-        1. Convert payload dict -> Action object
-        2. Negotiate (decide provider)
-        3. Execute via provider
+        Helper: call policy_engine.allow_action in async-safe way.
+        PolicyEngine may provide allow_action (sync) or allow_action_async (async).
         """
+        if self.policy_engine is None:
+            return True, "no_policy"
         try:
-            # Normalize type casing
-            if "type" in action_payload:
-                action_payload["type"] = action_payload["type"].lower()
-            
-            # Construct Action model
-            action = Action(**action_payload)
-            
-            # Negotiate
-            decision = self.negotiate_action(action)
-            if not decision:
-                return {"success": False, "error": "Negotiation failed: Policy denied or no provider found."}
-
-            # Fetch Provider
-            provider = self.registry.get(decision.provider)
-            if not provider:
-                return {"success": False, "error": f"Provider '{decision.provider}' not found in registry."}
-
-            # Execute
-            # Identify interface: HostBridge uses .execute(action), Sandbox uses .run(cmd)
-            if hasattr(provider, "execute"):
-                # HostBridge-like interface
-                return provider.execute(action)
-            elif hasattr(provider, "run"):
-                # Sandbox-like interface
-                return provider.run(
-                    action.command, 
-                    timeout=action.timeout_seconds, 
-                    env=action.args.get("env")
-                )
-            else:
-                return {"success": False, "error": f"Provider '{decision.provider}' has no known execution method."}
-
+            if hasattr(self.policy_engine, "allow_action_async") and asyncio.iscoroutinefunction(self.policy_engine.allow_action_async):
+                return await self.policy_engine.allow_action_async(actor, trust, action_name, resource)
+            # fallback to sync function in threadpool
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: self.policy_engine.allow_action(actor, trust, action_name, resource))
         except Exception as e:
-            logger.exception("Negotiator execution failed")
-            return {"success": False, "error": str(e)}
+            logger.exception("PolicyEngine check failed")
+            # permissive default
+            return True, "policy_error_permissive"
 
-    def negotiate_action(self, action: Action) -> Optional[NegotiationDecision]:
+    async def decide(self, action: Action, context: Optional[Dict[str, Any]] = None) -> Optional[NegotiationDecision]:
         try:
-            # 1. Fetch providers
-            providers = self.registry.list() # Simpler fallback: check all
-            # In a real impl, registry.get_providers(action.type) is better
-            
-            # 2. Policy Check
-            if self.policy:
-                decision = self.policy.check(action)
-                if not decision.allow:
-                    logger.warning(f"Policy blocked action: {decision.reason}")
-                    return None
+            ctx = context or {}
+            user = ctx.get("user_id", "system")
+            trust = ctx.get("trust_level", "low")
 
-            # 3. Simple selection logic
-            if action.type == ActionType.EXEC:
-                return NegotiationDecision("sandbox", "Default for EXEC")
+            provider = None
+            reason = "default"
+
+            if action.type == ActionType.PLUGIN:
+                module_name = getattr(action, "module", None)
+                if not module_name:
+                    provider = "simulated"
+                    reason = "missing_module"
+                else:
+                    plugin = get_plugin(module_name)
+                    if plugin:
+                        provider = module_name
+                        reason = "plugin_available"
+                    else:
+                        provider = "sandbox"
+                        reason = "plugin_missing_fallback"
+
             elif action.type == ActionType.HOST:
-                return NegotiationDecision("hostbridge", "Required for HOST action")
-            elif action.type == ActionType.PLUGIN:
-                # Naive plugin mapping
-                return NegotiationDecision(action.module, "Plugin request")
-            
-            return None
+                provider = "hostbridge"
+                reason = "host_required"
+
+            elif action.type == ActionType.EXEC:
+                pref = (getattr(action, "metadata", {}) or {}).get("preferred_provider")
+                if pref == "hostbridge":
+                    provider = "hostbridge"
+                    reason = "preferred_hostbridge"
+                elif pref == "plugin":
+                    mod = getattr(action, "module", None)
+                    if mod and get_plugin(mod):
+                        provider = mod
+                        reason = "preferred_plugin"
+                    else:
+                        provider = "sandbox"
+                        reason = "preferred_plugin_missing"
+                else:
+                    provider = "sandbox"
+                    reason = "default_exec_sandbox"
+
+            elif action.type == ActionType.SIMULATED:
+                provider = "simulated"
+                reason = "simulated"
+
+            else:
+                return None
+
+            # policy consult
+            allowed, policy_reason = await self._policy_allow(user, trust, getattr(action.type, "value", str(action.type)), {"module": getattr(action, "module", None), "command": getattr(action, "command", None)})
+            if not allowed:
+                logger.info("Negotiator: policy denied candidate provider=%s for action=%s user=%s reason=%s", provider, action.type, user, policy_reason)
+                return NegotiationDecision("denied", f"policy_denied:{policy_reason}")
+
+            return NegotiationDecision(provider, reason)
 
         except Exception as e:
-            logger.exception(f"Negotiation error: {e}")
+            logger.exception("Negotiator.decide error: %s", e)
             return None

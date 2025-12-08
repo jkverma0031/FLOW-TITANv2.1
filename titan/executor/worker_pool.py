@@ -1,93 +1,216 @@
-# Path: titan/executor/worker_pool.py
+# titan/executor/worker_pool.py
 from __future__ import annotations
+import asyncio
 import concurrent.futures
-import threading
-import time
 import logging
-from typing import Callable, Any, Dict, Optional
-from functools import partial
+from typing import Dict, Any, Optional, Callable, List
+import inspect
+import time
 
 logger = logging.getLogger(__name__)
 
 class WorkerPool:
     """
-    Manages a pool of threads or processes for executing actions asynchronously.
-    This component ensures that TaskNodes can be executed in a controlled, 
-    concurrent environment, essential for the Executor's efficiency.
+    Async-first WorkerPool / Task Scheduler.
     """
-    
-    # Default runner is a simple identity function for local testing
-    @staticmethod
-    def _default_runner(action_request: Dict[str, Any]) -> Dict[str, Any]:
-        """A simple placeholder runner if no Negotiator is provided."""
-        task_name = action_request.get('name', action_request.get('task_name', 'unknown'))
-        time.sleep(0.01) # Simulate minimal work
-        return {"status": "success", "message": f"Simulated execution of {task_name}", "result": {}}
 
-    def __init__(
-        self,
-        max_workers: int = 8,
-        runner: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-        executor_type: str = 'thread' # 'thread' or 'process'
-    ):
+    def __init__(self, max_workers: int = 16, thread_workers: int = 8):
         self.max_workers = max_workers
-        # The runner is the function that knows how to execute the action (usually the Negotiator)
-        self.runner = runner if runner is not None else self._default_runner
-        self.executor_type = executor_type.lower()
-        
-        # Internal state for the executor
-        self._executor: Optional[concurrent.futures.Executor] = None
-        self._is_running = False
-        self._lock = threading.Lock()
 
-    def start(self):
-        """Initializes and starts the underlying execution pool."""
-        with self._lock:
-            if self._is_running:
-                logger.warning("WorkerPool is already running.")
-                return
+        # FIX: remove unsafe loop init
+        self._loop = None
 
-            if self.executor_type == 'process':
-                self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers)
-            else:
-                # Default to ThreadPoolExecutor for simplicity and resource management in testing
-                self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
-            
-            self._is_running = True
-            logger.info(f"WorkerPool started with {self.max_workers} {self.executor_type} workers.")
+        # Threadpool used for blocking or CPU tasks
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=thread_workers)
 
-    def stop(self):
-        """Cleanly shuts down the execution pool."""
-        with self._lock:
-            if not self._is_running:
-                logger.warning("WorkerPool is already stopped.")
-                return
+        self._tasks: Dict[str, asyncio.Task] = {}
+        self._semaphore = asyncio.Semaphore(max_workers)
+        self._running = True
 
-            if self._executor:
-                # wait=True ensures all pending tasks complete before shutting down
-                self._executor.shutdown(wait=True)
-                self._executor = None
-            
-            self._is_running = False
-            logger.info("WorkerPool stopped.")
+    # --------------------------
+    # Public API: async-first
+    # --------------------------
+    async def run_async(self, action_request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Core execution entrypoint with async provider dispatch.
+        """
+        async with self._semaphore:
+            try:
+                action = action_request.get("action")
+                node = action_request.get("node")
+                task_args = action_request.get("task_args") or (getattr(action, "args", None) or {})
+                context = action_request.get("context") or {}
+                negotiator = action_request.get("_negotiator")
+                sandbox = action_request.get("_sandbox")
+                hostbridge = action_request.get("_hostbridge")
 
-    def submit(self, action_request: Dict[str, Any]) -> concurrent.futures.Future:
-        """Submits an action request to the pool for asynchronous execution."""
-        with self._lock:
-            if not self._is_running or not self._executor:
-                raise RuntimeError("WorkerPool must be started before submitting tasks.")
-            
-            # Use partial to pass action_request as the first argument to the runner
-            return self._executor.submit(self.runner, action_request)
+                # Negotiator
+                decision = None
+                if negotiator is not None and action is not None:
+                    try:
+                        if inspect.iscoroutinefunction(negotiator.decide):
+                            decision = await negotiator.decide(action, context=context)
+                        else:
+                            loop = asyncio.get_event_loop()
+                            decision = await loop.run_in_executor(self._executor, lambda: negotiator.decide(action, context=context))
+                    except Exception:
+                        logger.exception("Negotiator.decide failed")
+                        decision = None
 
+                provider = decision.provider if decision else None
+
+                # fallback provider
+                if not provider and node:
+                    metadata = node.get("metadata") or {}
+                    provider = metadata.get("provider") or metadata.get("plugin") or metadata.get("task_provider")
+
+                # type-based fallback
+                if not provider:
+                    atype = getattr(action, "type", None)
+                    try:
+                        if atype and getattr(atype, "name", "").upper() == "PLUGIN":
+                            provider = action.module
+                    except Exception:
+                        provider = None
+
+                if not provider:
+                    provider = "sandbox"
+
+                # -------------------------------------------------------
+                # Provider Routing
+                # -------------------------------------------------------
+
+                # PLUGINS
+                if provider not in ("sandbox", "hostbridge", "simulated", "denied"):
+                    from titan.runtime.plugins.registry import get_plugin
+                    plugin = get_plugin(provider)
+                    if not plugin:
+                        return {"status": "error", "error": f"plugin '{provider}' not registered"}
+
+                    loop = asyncio.get_event_loop()
+
+                    # Prefer async execution
+                    if hasattr(plugin, "execute_async") and inspect.iscoroutinefunction(plugin.execute_async):
+                        try:
+                            result = await plugin.execute_async(
+                                action=action.command if getattr(action, "command", None) else "run",
+                                args=(getattr(action, "args", None) or task_args) or {},
+                                context=context,
+                            )
+                            return {"status": "ok", "result": result}
+                        except Exception:
+                            logger.exception("plugin.execute_async failed; trying sync fallback")
+
+                            # Sync fallback in threadpool
+                            try:
+                                sync_result = await loop.run_in_executor(
+                                    self._executor,
+                                    lambda: plugin.execute(
+                                        action=action.command if getattr(action, "command", None) else "run",
+                                        args=(getattr(action, "args", None) or task_args) or {},
+                                        context=context,
+                                    ),
+                                )
+                                return {"status": "ok", "result": sync_result}
+                            except Exception as e:
+                                logger.exception("plugin.sync fallback failed")
+                                return {"status": "error", "error": str(e)}
+
+                    # If plugin has no async implementation
+                    loop = asyncio.get_event_loop()
+                    try:
+                        sync_result = await loop.run_in_executor(
+                            self._executor,
+                            lambda: plugin.execute(
+                                action=action.command if getattr(action, "command", None) else "run",
+                                args=(getattr(action, "args", None) or task_args) or {},
+                                context=context,
+                            ),
+                        )
+                        return {"status": "ok", "result": sync_result}
+                    except Exception as e:
+                        logger.exception("plugin.sync execution failed")
+                        return {"status": "error", "error": str(e)}
+
+                # SANDBOX
+                if provider == "sandbox":
+                    cmd = getattr(action, "command", None) or (getattr(action, "args", None) or {}).get("cmd")
+                    metadata = getattr(action, "metadata", {}) or {}
+                    timeout = metadata.get("timeout")
+
+                    if cmd is None and node:
+                        cmd = (node.get("metadata") or {}).get("command")
+
+                    if not cmd:
+                        return {"status": "error", "error": "Sandbox command missing"}
+
+                    if hasattr(sandbox, "run_command_async") and inspect.iscoroutinefunction(sandbox.run_command_async):
+                        out = await sandbox.run_command_async(cmd, timeout=timeout, context=context)
+                        return {"status": "ok", "result": out}
+
+                    # fallback: blocking run
+                    loop = asyncio.get_event_loop()
+                    out = await loop.run_in_executor(
+                        self._executor,
+                        lambda: sandbox.run_command(cmd, timeout=timeout, context=context),
+                    )
+                    return {"status": "ok", "result": out}
+
+                # HOSTBRIDGE
+                if provider == "hostbridge":
+                    if hasattr(hostbridge, "execute_async") and inspect.iscoroutinefunction(hostbridge.execute_async):
+                        out = await hostbridge.execute_async(action, context=context)
+                        return {"status": "ok", "result": out}
+
+                    loop = asyncio.get_event_loop()
+                    out = await loop.run_in_executor(
+                        self._executor,
+                        lambda: hostbridge.execute(action, context=context),
+                    )
+                    return {"status": "ok", "result": out}
+
+                # SIMulated
+                if provider == "simulated":
+                    return {"status": "ok", "result": {"message": "simulated"}}
+
+                if provider == "denied":
+                    return {"status": "error", "error": "action denied by policy"}
+
+                return {"status": "error", "error": f"unknown provider: {provider}"}
+
+            except Exception as e:
+                logger.exception("WorkerPool.run_async fatal error")
+                return {"status": "error", "error": str(e)}
+
+    # --------------------------------
+    # Sync wrapper
+    # --------------------------------
     def run_sync(self, action_request: Dict[str, Any]) -> Dict[str, Any]:
-        """Executes a single action synchronously (bypassing the pool for immediate results)."""
-        logger.debug(f"Executing action synchronously: {action_request.get('task_name')}")
-        return self.runner(action_request)
-        
-    def __enter__(self):
-        self.start()
-        return self
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self.run_async(action_request), loop
+                )
+                return future.result()
+            return asyncio.run(self.run_async(action_request))
+        except Exception as e:
+            logger.exception("WorkerPool.run_sync failed")
+            return {"status": "error", "error": str(e)}
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
+    # --------------------------------
+    # Submit Task
+    # --------------------------------
+    def submit(self, action_request: Dict[str, Any]) -> "asyncio.Task":
+        loop = asyncio.get_event_loop()
+        if not loop.is_running():
+            raise RuntimeError("submit() requires a running event loop")
+        return loop.create_task(self.run_async(action_request))
+
+    # --------------------------------
+    # Shutdown
+    # --------------------------------
+    async def shutdown(self):
+        self._running = False
+        await asyncio.sleep(0.01)
+        self._executor.shutdown(wait=True)
