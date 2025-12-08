@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+# ==========================================================
 # Sandbox & HostBridge
+# ==========================================================
 from titan.augmentation.sandbox.sandbox_runner import SandboxRunner
 from titan.augmentation.sandbox.docker_adapter import DockerAdapter
 from titan.augmentation.sandbox.execution_adapter import LocalExecutionAdapter
@@ -12,41 +14,61 @@ from titan.augmentation.sandbox.cleanup import cleanup_orphaned_containers
 from titan.augmentation.hostbridge.hostbridge_service import HostBridgeService
 from titan.augmentation.safety import is_command_safe
 
+# ==========================================================
 # Memory subsystem
+# ==========================================================
 from titan.memory.persistent_annoy_store import PersistentAnnoyStore
 from titan.memory.episodic_store import EpisodicStore
 from titan.memory.embeddings import Embedder
 
-# Runtime
+# ==========================================================
+# Runtime managers
+# ==========================================================
 from titan.runtime.session_manager import SessionManager
 from titan.runtime.context_store import ContextStore
 from titan.runtime.trust_manager import TrustManager
 from titan.runtime.identity import IdentityManager
 
+# ==========================================================
 # Executor
+# ==========================================================
 from titan.executor.orchestrator import Orchestrator
 from titan.executor.worker_pool import WorkerPool
 
-# Kernel
+# ==========================================================
+# Kernel Core
+# ==========================================================
 from titan.kernel.event_bus import EventBus
 from titan.kernel.capability_registry import CapabilityRegistry
 from titan.kernel.app_context import _SENTINEL
 
-# Parser
+# ==========================================================
+# Parser Subsystem
+# ==========================================================
 from titan.parser.adapter import ParserAdapter
 from titan.parser.heuristic_parser import HeuristicParser
 from titan.parser.llm_dsl_generator import LLMDslGenerator
 
+# ==========================================================
 # Plugins
+# ==========================================================
 from titan.runtime.plugins.registry import register_plugin
 from titan.runtime.plugins.filesystem import FilesystemPlugin
 from titan.runtime.plugins.http import HTTPPlugin
 
+# NEW Plugins
+from titan.runtime.plugins.desktop_plugin import DesktopPlugin
+from titan.runtime.plugins.browser_plugin import BrowserPlugin
+
+# ==========================================================
 # LLM Provider System
+# ==========================================================
 from titan.models.provider import ProviderRouter
 from titan.models.groq_provider import GroqProvider
 
-# Policy
+# ==========================================================
+# Policy Engine (optional)
+# ==========================================================
 try:
     from titan.policy.engine import PolicyEngine
     _policy_engine = PolicyEngine()
@@ -56,10 +78,10 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------------------------------------
+# Negotiator safe import helper
+# ----------------------------------------------------------
 def _import_negotiator():
-    """
-    Safely import Negotiator, fallback to alternative names.
-    """
     try:
         from titan.augmentation.negotiator import Negotiator
         return Negotiator
@@ -68,32 +90,31 @@ def _import_negotiator():
 
     try:
         import titan.augmentation.negotiator as _mod
-        for attr in ("Negotiator", "NegotiatorService", "NegotiatorEngine"):
-            if hasattr(_mod, attr):
-                return getattr(_mod, attr)
+        for name in ("Negotiator", "NegotiatorService", "NegotiatorEngine"):
+            if hasattr(_mod, name):
+                return getattr(_mod, name)
     except Exception:
         pass
 
-    logger.warning("Negotiator class not found; startup will continue without one")
+    logger.warning("Negotiator not found; continuing without negotiator.")
     return None
 
 
-
-# ========================================================================
-#                       STARTUP FUNCTION (FIXED)
-# ========================================================================
+# ==========================================================
+#                  STARTUP FUNCTION
+# ==========================================================
 def perform_kernel_startup(app, cfg: Optional[dict] = None):
     cfg = cfg or {}
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     # 1. EVENT BUS
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     event_bus = EventBus()
     app.register("event_bus", event_bus)
 
-    # --------------------------------------------------------------
-    # 2. LLM Provider Router + GroqProvider Wiring
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
+    # 2. LLM Provider Router (Groq integrated)
+    # ------------------------------------------------------
     router = ProviderRouter()
 
     groq_api_url = cfg.get("groq_api_url", "https://api.groq.com")
@@ -117,37 +138,35 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
 
     app.register("llm_provider_router", router)
 
-    # --------------------------------------------------------------
-    # 3. MEMORY (Vector + Episodic + Embedder)
-    # --------------------------------------------------------------
-    vec_db = cfg.get("memory_db_path", "data/memory.db")
-    idx_path = cfg.get("memory_index_path", "data/index.ann")
-    vec_dim = cfg.get("memory_vector_dim", 1536)
-
+    # ------------------------------------------------------
+    # 3. MEMORY SYSTEM
+    # ------------------------------------------------------
     vec_store = PersistentAnnoyStore(
-        meta_db_path=vec_db,
-        index_path=idx_path,
-        vector_dim=vec_dim,
+        meta_db_path=cfg.get("memory_db_path", "data/memory.db"),
+        index_path=cfg.get("memory_index_path", "data/index.ann"),
+        vector_dim=cfg.get("memory_vector_dim", 1536),
     )
-    epi_store = EpisodicStore(provenance_path=cfg.get("episodic_path", "data/provenance.jsonl"))
 
-    embedder = Embedder(provider=router)  # uses provider → Groq embeddings
+    epi_store = EpisodicStore(
+        provenance_path=cfg.get("episodic_path", "data/provenance.jsonl")
+    )
+
+    embedder = Embedder(provider=router)
 
     app.register("vector_store", vec_store)
     app.register("episodic_store", epi_store)
     app.register("embedding_service", embedder)
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     # 4. RUNTIME MANAGERS
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     trust_mgr = TrustManager(default_level=cfg.get("default_trust_level", "low"))
     identity_mgr = IdentityManager()
-    session_dir = cfg.get("session_autosave_dir", "data/sessions")
-
     session_mgr = SessionManager(
         default_ttl_seconds=cfg.get("session_ttl", 3600),
-        autosave_context_dir=session_dir,
+        autosave_context_dir=cfg.get("session_autosave_dir", "data/sessions"),
     )
+
     session_mgr.register_trust_manager(trust_mgr)
     session_mgr.register_identity_manager(identity_mgr)
 
@@ -155,12 +174,13 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
     app.register("identity_manager", identity_mgr)
     app.register("session_manager", session_mgr)
 
-    # --------------------------------------------------------------
-    # 5. SANDBOX + DOCKER
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
+    # 5. SANDBOX & DOCKER
+    # ------------------------------------------------------
     local_adapter = LocalExecutionAdapter(
         work_dir=cfg.get("sandbox_work_dir", "/tmp/titan_sandbox")
     )
+
     docker_adapter = DockerAdapter(
         image=cfg.get("docker_image", "python:3.11-slim"),
         work_dir=cfg.get("docker_work_dir", "/work"),
@@ -178,9 +198,9 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
     app.register("docker_adapter", docker_adapter)
     app.register("sandbox_cleanup", cleanup_orphaned_containers)
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     # 6. HOSTBRIDGE
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     hb = HostBridgeService(
         manifests_dir=cfg.get(
             "hostbridge_manifests_dir",
@@ -188,34 +208,49 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
         ),
         policy_engine=_policy_engine,
     )
+
     app.register("hostbridge", hb)
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     # 7. CAPABILITY REGISTRY
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     caps = CapabilityRegistry()
 
-    caps.register("sandbox", sandbox, metadata={"description": "local sandbox runner"})
-    caps.register("docker", docker_adapter, metadata={"description": "docker adapter"})
-    caps.register("hostbridge", hb, metadata={"description": "host bridge"})
+    caps.register("sandbox", sandbox)
+    caps.register("docker", docker_adapter)
+    caps.register("hostbridge", hb)
 
     app.register("cap_registry", caps)
 
-    # --------------------------------------------------------------
-    # 8. PLUGINS (Filesystem + HTTP)
-    # --------------------------------------------------------------
-    fs = FilesystemPlugin(sandbox_dir=cfg.get("plugin_filesystem_dir", "/tmp/titan_workspace"))
+    # ------------------------------------------------------
+    # 8. PLUGINS — Filesystem / HTTP / Desktop / Browser
+    # ------------------------------------------------------
+    fs = FilesystemPlugin(
+        sandbox_dir=cfg.get("plugin_filesystem_dir", "/tmp/titan_fs")
+    )
     http = HTTPPlugin(default_timeout=10)
+
+    desktop = DesktopPlugin(
+        sandbox_dir=cfg.get("plugin_desktop_sandbox", "/tmp/titan_desktop")
+    )
+    browser = BrowserPlugin(
+        headless=cfg.get("browser_headless", True),
+        default_storage_dir=cfg.get("browser_storage_dir", ".titan_browser_profiles")
+    )
 
     register_plugin("filesystem", fs)
     register_plugin("http", http)
+    register_plugin("desktop", desktop)
+    register_plugin("browser", browser)
 
     app.register("plugin_filesystem", fs)
     app.register("plugin_http", http)
+    app.register("plugin_desktop", desktop)
+    app.register("plugin_browser", browser)
 
-    # --------------------------------------------------------------
-    # 9. PARSER (Heuristic + LLM DSL Generator)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
+    # 9. PARSER (Heuristic + DSL)
+    # ------------------------------------------------------
     dsl_gen = LLMDslGenerator(
         llm_provider=router,
         cap_registry=caps,
@@ -224,17 +259,16 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
         default_model_role="dsl",
     )
 
-    heuristic = HeuristicParser()
     parser_adapter = ParserAdapter(
-        heuristic_parser=heuristic,
+        heuristic_parser=HeuristicParser(),
         llm_dsl_generator=dsl_gen,
     )
 
     app.register("parser_adapter", parser_adapter)
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     # 10. NEGOTIATOR
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
     NegotiatorClass = _import_negotiator()
     negotiator = None
 
@@ -246,23 +280,24 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
                 policy_engine=_policy_engine,
             )
         except Exception:
-            logger.exception("Failed to instantiate Negotiator")
+            logger.exception("Failed to initialize Negotiator")
             negotiator = None
 
     app.register("negotiator", negotiator)
 
-    # --------------------------------------------------------------
-    # 11. WORKER POOL (Async-First, Parallel Capable)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
+    # 11. WORKER POOL
+    # ------------------------------------------------------
     worker_pool = WorkerPool(
         max_workers=cfg.get("worker_pool_max_workers", 16),
         thread_workers=cfg.get("worker_thread_workers", 8),
     )
+
     app.register("worker_pool", worker_pool)
 
-    # --------------------------------------------------------------
-    # 12. ORCHESTRATOR (Async Execution Engine)
-    # --------------------------------------------------------------
+    # ------------------------------------------------------
+    # 12. ORCHESTRATOR
+    # ------------------------------------------------------
     orch = Orchestrator(
         worker_pool=worker_pool,
         event_emitter=event_bus.publish,
@@ -271,4 +306,4 @@ def perform_kernel_startup(app, cfg: Optional[dict] = None):
 
     app.register("orchestrator", orch)
 
-    logger.info("[Kernel] Startup wiring completed (async-first, provider-aware).")
+    logger.info("[Kernel] Startup wiring completed (async-first, plugin-rich, provider-aware).")
