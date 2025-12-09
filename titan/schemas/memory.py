@@ -1,6 +1,6 @@
-# Path: FLOW/titan/schemas/memory.py
+# titan/schemas/memory.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, List
 from pydantic import BaseModel, Field
 from uuid import uuid4
 from datetime import datetime
@@ -12,25 +12,48 @@ def new_memory_id(prefix: str = "m") -> str:
 
 class MemoryRecord(BaseModel):
     """
-    A single memory record for semantic memory / episodic store.
-    Embeddings optional and can be added asynchronously.
+    Unified memory record used by:
+    - episodic store
+    - semantic memory vector DB
+    - skill-generated annotations
+    - planner context history
     """
     id: str = Field(default_factory=new_memory_id)
     text: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    # Embedding is optional and added lazily
     embedding: Optional[List[float]] = None
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-    source: Optional[str] = None  # e.g. "planner.dsl", "executor.event", "user.input"
 
-    class Config:
-        extra = "forbid"
+    created_at: str = Field(
+        default_factory=lambda: datetime.utcnow().isoformat() + "Z"
+    )
 
-    def with_embedding(self, emb: List[float]) -> "MemoryRecord":
-        self.embedding = emb
+    # Source field is critical for skill-based summarization
+    source: Optional[str] = Field(
+        default=None,
+        description="Where this memory came from: planner, executor, perception, skill, user"
+    )
+
+    model_config = {"extra": "forbid"}
+
+    # ----------------------------------------
+    # Embedding Helpers
+    # ----------------------------------------
+    def with_embedding(self, vec: List[float]) -> "MemoryRecord":
+        self.embedding = vec
         return self
 
+    # ----------------------------------------
+    # Vector DB serialization
+    # ----------------------------------------
     def to_index_doc(self) -> Dict[str, Any]:
-        """Return the serializable document that will be stored in vector DB + sqlite."""
+        """
+        Converts memory into a dict suitable for:
+        - Pinecone / Annoy / FAISS
+        - SQLite JSON storage
+        - JSON event logs
+        """
         return {
             "id": self.id,
             "text": self.text,

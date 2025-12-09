@@ -5,23 +5,17 @@ from enum import Enum
 from pydantic import BaseModel, Field, model_validator
 from uuid import uuid4
 
-
 class ActionType(str, Enum):
-    # Enum values must be lowercase to correctly enforce ActionType in the Negotiator
     EXEC = "exec"
     PLUGIN = "plugin"
     HOST = "host"
     SIMULATED = "simulated"
 
-
 def new_action_id(prefix: str = "a") -> str:
     return f"{prefix}{uuid4().hex[:8]}"
 
-
 class Action(BaseModel):
     id: str = Field(default_factory=new_action_id)
-    # The type field will automatically normalize to lowercase string on creation
-    # e.g., Action(type="EXEC") -> type="exec"
     type: ActionType
     command: Optional[str] = None
     module: Optional[str] = None
@@ -32,7 +26,6 @@ class Action(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    # Centralized cross-field validation (Pydantic v2)
     @model_validator(mode="after")
     def validate_action(self):
         if self.type == ActionType.EXEC:
@@ -43,7 +36,7 @@ class Action(BaseModel):
         if self.type in (ActionType.PLUGIN, ActionType.HOST):
             if not self.module:
                 raise ValueError(f"{self.type.value.upper()} actions require a module name")
-            self.command = None # Module actions don't use a raw command field
+            self.command = None  # Module actions don't use a raw command field
 
         return self
 

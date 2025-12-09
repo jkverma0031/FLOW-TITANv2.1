@@ -1,56 +1,25 @@
-import asyncio
-import json
-from titan.kernel.app_context import AppContext
-from titan.kernel.startup import perform_kernel_startup
+from titan.kernel.kernel import Kernel
 
-print("🚀 TITAN SMOKE TEST STARTING...\n")
+def main():
+    print("Booting TITAN Kernel…")
 
-app = AppContext()
+    kernel = Kernel()
+    print("\n[OK] Kernel object created")
 
-print("🔧 Performing kernel startup...\n")
-perform_kernel_startup(app)
+    print("\nStarting services via startup sequence…")
+    kernel.start()
 
-print("✅ Startup completed. Retrieving orchestrator...\n")
+    print("\n[OK] Startup complete")
+    print("Registered Services:", list(kernel.app.list_services().keys()))
 
-orch = app.get("orchestrator")
-if orch is None:
-    raise RuntimeError("❌ Orchestrator missing after startup")
+    print("\nRunning diagnostics…")
+    diag = kernel.app.get("diagnostics")
+    print(diag.system_health())
 
-print("🔍 Orchestrator loaded:", orch)
+    print("\nShutting down TITAN Kernel…")
+    kernel.shutdown()
+    print("[OK] Shutdown complete")
 
-# ------------------------------------------------------
-# ASYNC SMOKE TEST: EXECUTE A FAKE PLAN USING WORKERPOOL
-# ------------------------------------------------------
-async def run_test():
-    print("\n⚙️  Running orchestrator smoke execution...")
 
-    fake_plan = {
-        "nodes": [
-            {
-                "id": "n1",
-                "type": "plugin",
-                "plugin": "filesystem",
-                "action": "write_file",
-                "args": {"path": "hello.txt", "text": "Hello Titan!"}
-            },
-            {
-                "id": "n2",
-                "type": "plugin",
-                "plugin": "filesystem",
-                "action": "read_file",
-                "args": {"path": "hello.txt"}
-            }
-        ]
-    }
-
-    try:
-        # FIX: Remove "actor"
-        result = await orch.execute_plan(fake_plan)
-        print("\n🎉 RESULT:")
-        print(json.dumps(result, indent=2))
-    except Exception as e:
-        print("❌ Execution failed:", e)
-
-asyncio.run(run_test())
-
-print("\n🏁 SMOKE TEST FINISHED.\n")
+if __name__ == "__main__":
+    main()

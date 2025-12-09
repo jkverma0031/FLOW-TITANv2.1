@@ -1,12 +1,11 @@
-# Path: FLOW/titan/schemas/events.py
+# titan/schemas/events.py
 from __future__ import annotations
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
 from enum import Enum
 import hashlib
 import json
-
 
 class EventType(str, Enum):
     PLAN_CREATED = "PlanCreated"
@@ -22,10 +21,8 @@ class EventType(str, Enum):
     PLAN_COMPLETED = "PlanCompleted"
     ERROR_OCCURRED = "ErrorOccurred"
 
-
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
-
 
 class Event(BaseModel):
     id: Optional[str] = None
@@ -37,8 +34,7 @@ class Event(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        extra = "forbid"
+    model_config = {"extra": "forbid"}
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -53,12 +49,7 @@ class Event(BaseModel):
         }
 
     def to_provenance_entry(self, previous_hash: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Produce a provenance-ready entry. This returns a stable entry dict
-        including a deterministic hash over canonicalized event content.
-        """
         event_obj = self.as_dict()
-        # canonicalize using json.dumps with sort_keys
         canonical = json.dumps(event_obj, sort_keys=True, separators=(",", ":"))
         entry_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         entry = {
@@ -69,19 +60,18 @@ class Event(BaseModel):
         }
         return entry
 
-
-# Convenience specialized events
 class NodeEvent(Event):
     node_id: str
-
+    model_config = {"extra": "forbid"}
 
 class TaskEvent(Event):
     task_id: str
     result: Optional[Dict[str, Any]] = None
     success: Optional[bool] = None
-
+    model_config = {"extra": "forbid"}
 
 class ErrorEvent(Event):
     error_message: str
     exception_name: Optional[str] = None
     traceback: Optional[str] = None
+    model_config = {"extra": "forbid"}
