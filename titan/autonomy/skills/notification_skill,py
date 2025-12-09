@@ -1,0 +1,153 @@
+# titan/autonomy/skills/notification_skill.py
+"""
+NotificationSkill (enterprise-grade v1)
+- Listens for perception.notification events.
+- Classifies notifications (messaging, system, calendar).
+- Produces SkillProposal(s) such as:
+    - read_notification (low risk)
+    - summarize_notifications (low/medium risk)
+    - urgent_alert (high risk)
+- Honors per-skill autonomy_mode and global runtime ask-first override.
+- Uses cooldown + de-duplication + minimal NLP heuristics (lightweight).
+"""
+from __future__ import annotations
+import asyncio
+import logging
+import time
+from typing import Dict, Any, Optional, List
+import hashlib
+
+from .base import BaseSkill
+from .proposal import SkillProposal, RiskLevel
+
+logger = logging.getLogger("titan.skills.notification")
+
+# Optional metrics if present (best-effort)
+try:
+    from titan.observability.metrics import metrics  # type: ignore
+except Exception:
+    metrics = None
+
+def _fingerprint_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+class NotificationSkill(BaseSkill):
+    NAME = "notification_skill"
+    DESCRIPTION = "Monitors OS/app notifications and proposes helpful actions (read/summarize/urgent)."
+    TICK_INTERVAL = 0.0  # event-driven only
+    SUBSCRIPTIONS = ("perception.notification",)
+    PRIORITY = 90
+    COOLDOWN = 8.0  # seconds between identical proposals
+    MAX_RECENT = 50
+
+    # small heuristic maps
+    MESSAGE_APPS = ("whatsapp", "telegram", "slack", "messaging", "sms", "signal", "wechat")
+    URGENT_KEYWORDS = ("urgent", "immediately", "asap", "important", "now", "alert", "emergency")
+
+    async def on_start(self) -> None:
+        await super().on_start()
+        self.logger.info("NotificationSkill started")
+        # persistent metadata holds dedup and counters
+        self.persistent_state.metadata.setdefault("recent_fingerprints", [])
+        self.persistent_state.metadata.setdefault("prompts_issued", 0)
+        self.save_persistent()
+
+    async def on_event(self, event: Dict[str, Any], ctx) -> None:
+        """
+        Main entry: receives perception.notification events from the manager context.
+        event payload shape may vary; we defensively extract fields.
+        """
+        try:
+            payload = event.get("payload") or {}
+            app = (payload.get("app") or "").lower()
+            title = str(payload.get("title") or "")
+            body = str(payload.get("text") or payload.get("body") or payload.get("message") or "")
+            full_text = (title + " " + body).strip()
+            if not full_text:
+                return
+
+            fp = _fingerprint_text(full_text)
+            recent = list(self.persistent_state.metadata.get("recent_fingerprints", []))
+            if fp in recent:
+                logger.debug("NotificationSkill: duplicate notification fingerprint ignored")
+                return
+
+            # classify
+            is_messaging = any(k in app for k in self.MESSAGE_APPS) or any(k in full_text.lower() for k in ("msg", "message", "whatsapp", "slack"))
+            contains_urgent = any(k in full_text.lower() for k in self.URGENT_KEYWORDS)
+
+            # rate-limit identical proposals via in-memory and persistent dedup
+            if not self.allowed_to_act():
+                logger.debug("NotificationSkill: cooldown/disabled - skipping proposal")
+                return
+
+            proposals: List[SkillProposal] = []
+
+            # urgent -> high-risk alert proposal
+            if contains_urgent:
+                proposals.append(SkillProposal(
+                    skill_name=self.NAME,
+                    intent="urgent_alert",
+                    confidence=0.98,
+                    params={"app": app, "title": title, "body_snippet": body[:300]},
+                    risk=RiskLevel.HIGH,
+                    timestamp=time.time(),
+                ))
+            # messaging -> read or summarize
+            if is_messaging:
+                proposals.append(SkillProposal(
+                    skill_name=self.NAME,
+                    intent="read_notification",
+                    confidence=0.92,
+                    params={"app": app, "title": title, "body_snippet": body[:400]},
+                    risk=RiskLevel.LOW,
+                    timestamp=time.time(),
+                ))
+                # a secondary summarization suggestion (medium risk)
+                if len(body) > 120:
+                    proposals.append(SkillProposal(
+                        skill_name=self.NAME,
+                        intent="summarize_notification",
+                        confidence=0.88,
+                        params={"app": app, "body_snippet": body[:600]},
+                        risk=RiskLevel.MEDIUM,
+                        timestamp=time.time(),
+                    ))
+            # system notifications - propose summary or system-check (low/medium)
+            if not is_messaging and not contains_urgent:
+                proposals.append(SkillProposal(
+                    skill_name=self.NAME,
+                    intent="log_system_notification",
+                    confidence=0.6,
+                    params={"app": app, "title": title, "body_snippet": body[:300]},
+                    risk=RiskLevel.LOW,
+                    timestamp=time.time(),
+                ))
+
+            # publish proposals (respect dedup)
+            for p in proposals:
+                try:
+                    # serialize safely
+                    payload_event = {
+                        "type": "skill.proposal",
+                        "source": "skill",
+                        "proposal": p.model_dump() if hasattr(p, "model_dump") else p.__dict__,
+                        "skill": self.NAME,
+                        "ts": time.time(),
+                    }
+                    await ctx.publish_event(payload_event)
+                    # record dedup and counters
+                    recent.insert(0, fp)
+                    if len(recent) > self.MAX_RECENT:
+                        recent = recent[:self.MAX_RECENT]
+                    self.persistent_state.metadata["recent_fingerprints"] = recent
+                    self.persistent_state.metadata["prompts_issued"] = self.persistent_state.metadata.get("prompts_issued", 0) + 1
+                    self.persistent_state.touch_action()
+                    self.save_persistent()
+                    self.mark_action()
+                    if metrics:
+                        metrics.counter("skill.notification.proposals_total").inc()
+                except Exception:
+                    logger.exception("NotificationSkill: failed to publish proposal")
+        except Exception:
+            logger.exception("NotificationSkill.on_event top-level error")
